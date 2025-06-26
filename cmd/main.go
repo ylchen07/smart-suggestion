@@ -139,7 +139,20 @@ Examples:
         NAME           READY   STATUS             RESTARTS         AGE
         pod-name-aaa   2/3     CrashLoopBackOff   358 (111s ago)   30h
         pod-name-bbb   2/3     CrashLoopBackOff   358 (3m8s ago)   30h
-      Your response: '=kubectl -n my-namespace describe pod pod-name-aaa --show-events' (kubectl is the command for interacting with kubernetes)
+      Your response: '=kubectl -n my-namespace logs pod-name-aaa' (kubectl is the command for interacting with kubernetes)
+    * Shell buffer:
+        # k -n my-namespace get pod
+        NAME           READY   STATUS             RESTARTS         AGE
+        pod-name-aaa   3/3     Running            0                30h
+        pod-name-bbb   0/3     Pending            0                30h
+      Your response: '=kubectl -n my-namespace describe pod pod-name-bbb' (kubectl is the command for interacting with kubernetes)
+    * Shell buffer:
+        # k -n my-namespace get pod
+        NAME           READY   STATUS             RESTARTS         AGE
+        pod-name-aaa   3/3     Running            0                30h
+        pod-name-bbb   0/3     Pending            0                30h
+	  User input: 'k -n'
+      Your response: '+ my-namespace describe pod pod-name-bbb' (kubectl is the command for interacting with kubernetes)
     * Shell buffer:
         # k get node
         NAME      STATUS   ROLES    AGE   VERSION
