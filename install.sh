@@ -205,7 +205,7 @@ install_smart_suggestion() {
     tar -xzf "$temp_archive" -C "$INSTALL_DIR" --strip-components=1
     
     # Make binary executable
-    chmod +x "$INSTALL_DIR/smart-suggestion-fetch"
+    chmod +x "$INSTALL_DIR/smart-suggestion"
     
     # Clean up
     rm -f "$temp_archive"
@@ -246,7 +246,7 @@ check_zsh_autosuggestions() {
 # Setup zshrc configuration
 setup_zshrc() {
     local zshrc_file="$HOME/.zshrc"
-    local source_line="source $INSTALL_DIR/$PLUGIN_FILE"
+    local source_line="source $INSTALL_DIR/$PLUGIN_FILE # smart-suggestion"
     
     log_info "Setting up zsh configuration..."
     
@@ -264,10 +264,10 @@ setup_zshrc() {
     
     # Add source line to .zshrc
     echo "" >> "$zshrc_file"
-    echo "# Smart Suggestion" >> "$zshrc_file"
+    echo "# Smart Suggestion # smart-suggestion" >> "$zshrc_file"
     echo "$source_line" >> "$zshrc_file"
     
-    log_success "Added smart-suggestion to $zshrc_file"
+    log_success "Added smart-suggestion to $zshrc_file with proxy mode enabled by default"
 }
 
 # Display post-installation instructions
@@ -285,7 +285,7 @@ show_post_install_instructions() {
     echo -e "   ${YELLOW}source ~/.zshrc${NC}"
     echo ""
     echo "3. Test the installation:"
-    echo -e "   ${YELLOW}smart-suggestion${NC}"
+    echo -e "   ${YELLOW}$INSTALL_DIR/smart-suggestion${NC}"
     echo ""
     echo "4. Use smart suggestions:"
     echo "   - Type a command or describe what you want to do"

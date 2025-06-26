@@ -10,12 +10,18 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/spf13/cobra"
+	"github.com/yetone/smart-suggestion/pkg"
+	"golang.org/x/term"
 )
 
 // OpenAI API structures
@@ -148,24 +154,76 @@ var (
 	debug         bool
 	outputFile    string
 	sendContext   bool
+	proxyMode     bool
+	proxyLogFile  string
+	
+	// Global log rotator instance
+	logRotator *pkg.LogRotator
 )
+
+// Initialize log rotator
+func init() {
+	config := pkg.DefaultLogRotateConfig()
+	// Set smaller max size for more frequent rotation testing
+	config.MaxSize = 5 * 1024 * 1024 // 5MB
+	config.MaxBackups = 3
+	config.Compress = true
+	config.MaxAge = 7 // 7 days
+	
+	logRotator = pkg.NewLogRotator(config)
+}
 
 func main() {
 	var rootCmd = &cobra.Command{
-		Use:   "smart-suggestion-fetch",
-		Short: "Fetch AI suggestions for zsh",
+		Use:   "smart-suggestion",
+		Short: "AI-powered smart suggestions for shell commands",
 		Run:   runFetch,
 	}
 
-	rootCmd.Flags().StringVarP(&provider, "provider", "p", "", "AI provider (openai or anthropic)")
+	// Add proxy command
+	var proxyCmd = &cobra.Command{
+		Use:   "proxy",
+		Short: "Start shell proxy mode to record commands and output",
+		Run:   runProxy,
+	}
+
+	// Add rotate-logs command
+	var rotateCmd = &cobra.Command{
+		Use:   "rotate-logs",
+		Short: "Rotate log files to prevent them from growing too large",
+		Run:   runRotateLogs,
+	}
+
+
+	// Root command flags
+	rootCmd.Flags().StringVarP(&provider, "provider", "p", "", "AI provider (openai, anthropic, or gemini)")
 	rootCmd.Flags().StringVarP(&input, "input", "i", "", "User input")
 	rootCmd.Flags().StringVarP(&systemPrompt, "system", "s", "", "System prompt (optional, uses default if not provided)")
 	rootCmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
 	rootCmd.Flags().StringVarP(&outputFile, "output", "o", "/tmp/smart_suggestion", "Output file path")
 	rootCmd.Flags().BoolVarP(&sendContext, "context", "c", false, "Include context information")
 
-	rootCmd.MarkFlagRequired("provider")
-	rootCmd.MarkFlagRequired("input")
+	// Proxy command flags
+	proxyCmd.Flags().StringVarP(&proxyLogFile, "log-file", "l", "/tmp/smart_suggestion_proxy.log", "Proxy log file path")
+	proxyCmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
+
+	// Rotate-logs command flags
+	rotateCmd.Flags().StringVarP(&proxyLogFile, "log-file", "l", "/tmp/smart_suggestion_proxy.log", "Log file path to rotate (required)")
+	rotateCmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
+
+	rootCmd.AddCommand(proxyCmd)
+	rootCmd.AddCommand(rotateCmd)
+
+	// Only require provider and input for the main fetch command
+	if len(os.Args) > 1 && os.Args[1] != "proxy" && os.Args[1] != "rotate-logs" {
+		rootCmd.MarkFlagRequired("provider")
+		rootCmd.MarkFlagRequired("input")
+	}
+
+	// Require log-file for rotate-logs command
+	if len(os.Args) > 1 && os.Args[1] == "rotate-logs" {
+		rotateCmd.MarkFlagRequired("log-file")
+	}
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -177,6 +235,7 @@ func runFetch(cmd *cobra.Command, args []string) {
 	if systemPrompt == "" {
 		systemPrompt = defaultSystemPrompt
 	}
+	
 	// Build the complete prompt with context if requested
 	completePrompt := systemPrompt
 	if sendContext {
@@ -406,7 +465,27 @@ func fetchAnthropic() (string, error) {
 	return response.Content[0].Text, nil
 }
 
+// writeToLogFile writes content to a log file with automatic rotation
+func writeToLogFile(logFilePath, content string) error {
+	// Check and rotate log file if necessary
+	if err := logRotator.CheckAndRotate(logFilePath); err != nil {
+		log.Printf("Failed to rotate log file: %v", err)
+		// Continue with logging even if rotation fails
+	}
+	
+	file, err := os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open log file: %w", err)
+	}
+	defer file.Close()
+
+	_, err = file.WriteString(content + "\n")
+	return err
+}
+
 func logDebug(message string, data map[string]any) {
+	logFilePath := "/tmp/smart-suggestion.log"
+	
 	logEntry := map[string]any{
 		"date":    time.Now().Format(time.RFC3339),
 		"log":     message,
@@ -422,14 +501,9 @@ func logDebug(message string, data map[string]any) {
 		return
 	}
 
-	file, err := os.OpenFile("/tmp/smart-suggestion.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Printf("Failed to open debug log file: %v", err)
-		return
+	if err := writeToLogFile(logFilePath, string(jsonData)); err != nil {
+		log.Printf("Failed to write debug log: %v", err)
 	}
-	defer file.Close()
-
-	file.WriteString(string(jsonData) + "\n")
 }
 
 // buildContextInfo builds context information similar to the zsh plugin
@@ -723,57 +797,439 @@ func getShellHistory() (string, error) {
 		numLinesStr = "10"
 	}
 
-	// Get the number of lines to fetch
-	numLines, err := strconv.Atoi(numLinesStr)
-	if err != nil {
-		return "", fmt.Errorf("SMART_SUGGESTION_HISTORY_LINES is not a valid number: %w", err)
-	}
-
-	// Get the shell history file path
-	historyFile := os.Getenv("HISTFILE")
-	if historyFile == "" {
-		historyFile = "~/.zsh_history"
-	}
-
-	// Read the history file
-	file, err := os.Open(historyFile)
-	if err != nil {
-		return "", fmt.Errorf("failed to open history file: %w", err)
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	scanner.Split(bufio.ScanLines)
-
-	var historyLines []string
-	for i := 0; i < numLines; i++ {
-		if !scanner.Scan() {
-			break
-		}
-		historyLines = append(historyLines, scanner.Text())
-	}
-
-	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("failed to read history file: %w", err)
-	}
-
-	return strings.Join(historyLines, "\n"), nil
-}
-
-// getShellBuffer gets tmux buffer content
-func getShellBuffer() (string, error) {
-	// Check if we're in a tmux session
-	if os.Getenv("TMUX") == "" {
-		return "", fmt.Errorf("not in a tmux session")
-	}
-	
-	cmd := exec.Command("tmux", "capture-pane", "-pS", "-")
+	cmd := exec.Command("fc", "-ln", fmt.Sprintf("-%s", numLinesStr))
 	output, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("failed to capture tmux pane: %w", err)
+		return "", fmt.Errorf("failed to run history command: %w", err)
 	}
-	
-	// No need to escape quotes here as Go handles JSON encoding properly
 	return strings.TrimSpace(string(output)), nil
 }
+
+// createProcessLock creates a lock file to prevent duplicate processes
+func createProcessLock(lockPath string) (*os.File, error) {
+	// Create directory if it doesn't exist
+	dir := filepath.Dir(lockPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create lock directory: %w", err)
+	}
+	
+	// Try to create and lock the file
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0644)
+	if err != nil {
+		if os.IsExist(err) {
+			// Check if the process is still running
+			if isProcessRunning(lockPath) {
+				return nil, fmt.Errorf("another instance is already running")
+			}
+			// Remove stale lock file
+			os.Remove(lockPath)
+			// Try again
+			file, err = os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0644)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create lock file: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("failed to create lock file: %w", err)
+		}
+	}
+	
+	// Try to acquire an exclusive lock
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		file.Close()
+		os.Remove(lockPath)
+		return nil, fmt.Errorf("failed to acquire lock: %w", err)
+	}
+	
+	// Write PID to the lock file
+	pid := os.Getpid()
+	if _, err := file.WriteString(fmt.Sprintf("%d\n", pid)); err != nil {
+		file.Close()
+		os.Remove(lockPath)
+		return nil, fmt.Errorf("failed to write PID to lock file: %w", err)
+	}
+	
+	if err := file.Sync(); err != nil {
+		file.Close()
+		os.Remove(lockPath)
+		return nil, fmt.Errorf("failed to sync lock file: %w", err)
+	}
+	
+	return file, nil
+}
+
+// isProcessRunning checks if the process in the lock file is still running
+func isProcessRunning(lockPath string) bool {
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		return false
+	}
+	
+	pidStr := strings.TrimSpace(string(data))
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil {
+		return false
+	}
+	
+	// Check if process is running by sending signal 0
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	
+	err = process.Signal(syscall.Signal(0))
+	return err == nil
+}
+
+// cleanupProcessLock removes the lock file and closes the file handle
+func cleanupProcessLock(file *os.File, lockPath string) {
+	if file != nil {
+		syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		file.Close()
+	}
+	os.Remove(lockPath)
+}
+
+// runProxy starts the shell proxy mode using PTY
+func runProxy(cmd *cobra.Command, args []string) {
+	// Create a lock file to prevent duplicate proxy processes
+	lockPath := "/tmp/smart-suggestion-proxy.lock"
+	lockFile, err := createProcessLock(lockPath)
+	if err != nil {
+		if debug {
+			logDebug("Failed to create process lock", map[string]any{
+				"error":     err.Error(),
+				"lock_path": lockPath,
+			})
+		}
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	
+	// Ensure cleanup on exit
+	defer cleanupProcessLock(lockFile, lockPath)
+	
+	if debug {
+		logDebug("Starting shell proxy mode with PTY", map[string]any{
+			"log_file":  proxyLogFile,
+			"lock_file": lockPath,
+			"pid":       os.Getpid(),
+		})
+	}
+	
+	// Get the user's shell, default to bash if not set
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/bash"
+	}
+	
+	// Create a shell command
+	c := exec.Command(shell)
+	
+	// Start the shell with a pty
+	ptmx, err := pty.Start(c)
+	if err != nil {
+		if debug {
+			logDebug("Failed to start PTY", map[string]any{
+				"error": err.Error(),
+				"shell": shell,
+			})
+		}
+		fmt.Fprintf(os.Stderr, "Failed to start PTY: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = ptmx.Close() }()
+	
+	// Handle pty size changes
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGWINCH)
+	go func() {
+		for range ch {
+			if err := pty.InheritSize(os.Stdin, ptmx); err != nil {
+				if debug {
+					logDebug("Error resizing pty", map[string]any{
+						"error": err.Error(),
+					})
+				}
+			}
+		}
+	}()
+	ch <- syscall.SIGWINCH // Initial resize
+	defer func() { signal.Stop(ch); close(ch) }()
+	
+	// Set stdin in raw mode to properly handle terminal input (only if it's a terminal)
+	var oldState *term.State
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		oldState, err = term.MakeRaw(int(os.Stdin.Fd()))
+		if err != nil {
+			if debug {
+				logDebug("Failed to set raw mode", map[string]any{
+					"error": err.Error(),
+				})
+			}
+			fmt.Fprintf(os.Stderr, "Failed to set raw mode: %v\n", err)
+			os.Exit(1)
+		}
+		defer func() { 
+			if oldState != nil {
+				_ = term.Restore(int(os.Stdin.Fd()), oldState) 
+			}
+		}()
+	} else {
+		if debug {
+			logDebug("Stdin is not a terminal, skipping raw mode", map[string]any{
+				"stdin_fd": int(os.Stdin.Fd()),
+			})
+		}
+	}
+
+	// try to delete log file if it exists
+	if _, err := os.Stat(proxyLogFile); err == nil {
+		if err := os.Remove(proxyLogFile); err != nil {
+			if debug {
+				logDebug("Failed to delete log file", map[string]any{
+					"error":    err.Error(),
+					"log_file": proxyLogFile,
+				})
+			}
+			fmt.Fprintf(os.Stderr, "Failed to delete log file: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	
+	// Open log file for writing
+	logFile, err := os.OpenFile(proxyLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		if debug {
+			logDebug("Failed to open log file", map[string]any{
+				"error":    err.Error(),
+				"log_file": proxyLogFile,
+			})
+		}
+		fmt.Fprintf(os.Stderr, "Failed to open log file: %v\n", err)
+		os.Exit(1)
+	}
+	defer logFile.Close()
+	
+	// Create a tee writer to write to both stdout and log file
+	teeWriter := io.MultiWriter(os.Stdout, logFile)
+	
+	// Handle graceful shutdown
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	
+	// Start goroutines for copying data
+	done := make(chan struct{})
+	
+	// Copy from stdin to pty (user input)
+	go func() {
+		defer close(done)
+		_, err := io.Copy(ptmx, os.Stdin)
+		if err != nil && debug {
+			logDebug("Error copying stdin to pty", map[string]any{
+				"error": err.Error(),
+			})
+		}
+	}()
+	
+	// Copy from pty to stdout and log file (shell output)
+	go func() {
+		_, err := io.Copy(teeWriter, ptmx)
+		if err != nil && debug {
+			logDebug("Error copying pty to output", map[string]any{
+				"error": err.Error(),
+			})
+		}
+		done <- struct{}{}
+	}()
+	
+	// Wait for either completion or signal
+	select {
+	case <-done:
+		if debug {
+			logDebug("PTY session completed", map[string]any{
+				"log_file": proxyLogFile,
+			})
+		}
+	case sig := <-sigCh:
+		if debug {
+			logDebug("Received signal, shutting down", map[string]any{
+				"signal":   sig.String(),
+				"log_file": proxyLogFile,
+			})
+		}
+	}
+}
+
+// getShellBuffer gets terminal buffer content using multiple methods
+func getShellBuffer() (string, error) {
+	// Try tmux first if available
+	if os.Getenv("TMUX") != "" {
+		cmd := exec.Command("tmux", "capture-pane", "-pS", "-")
+		output, err := cmd.Output()
+		if err == nil {
+			return strings.TrimSpace(string(output)), nil
+		}
+		if debug {
+			logDebug("Failed to get tmux buffer", map[string]any{
+				"error": err.Error(),
+			})
+		}
+	}
+	
+	// Try to read from proxy log file if it exists
+	if proxyLogFile != "" {
+		content, err := readLatestProxyContent(proxyLogFile)
+		if err == nil {
+			return content, nil
+		}
+		if debug {
+			logDebug("Failed to read proxy log", map[string]any{
+				"error": err.Error(),
+				"file":  proxyLogFile,
+			})
+		}
+	}
+	
+	// Try screen if available
+	content, err := getScreenBuffer()
+	if err == nil {
+		return content, nil
+	}
+	
+	// Try to get terminal buffer using tput if available
+	content, err = getTerminalBufferWithTput()
+	if err == nil {
+		return content, nil
+	}
+	
+	return "", fmt.Errorf("no terminal buffer available - not in tmux/screen session and no proxy log found")
+}
+
+// readLatestProxyContent reads the latest content from proxy log file
+func readLatestProxyContent(logFile string) (string, error) {
+	file, err := os.Open(logFile)
+	if err != nil {
+		return "", fmt.Errorf("failed to open proxy log file: %w", err)
+	}
+	defer file.Close()
+	
+	// Read the last N lines from the file
+	const maxLines = 50
+	scanner := bufio.NewScanner(file)
+	var lines []string
+	
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+		// Keep only the last maxLines
+		if len(lines) > maxLines {
+			lines = lines[1:]
+		}
+	}
+	
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("failed to read proxy log file: %w", err)
+	}
+	
+	return strings.Join(lines, "\n"), nil
+}
+
+// getScreenBuffer tries to get buffer from GNU screen
+func getScreenBuffer() (string, error) {
+	// Check if we're in a screen session
+	if os.Getenv("STY") == "" {
+		return "", fmt.Errorf("not in a screen session")
+	}
+	
+	// Try to capture screen buffer
+	cmd := exec.Command("screen", "-X", "hardcopy", "/tmp/screen_buffer.txt")
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to capture screen buffer: %w", err)
+	}
+	
+	// Read the captured buffer
+	content, err := os.ReadFile("/tmp/screen_buffer.txt")
+	if err != nil {
+		return "", fmt.Errorf("failed to read screen buffer: %w", err)
+	}
+	
+	// Clean up the temporary file
+	os.Remove("/tmp/screen_buffer.txt")
+	
+	return strings.TrimSpace(string(content)), nil
+}
+
+// getTerminalBufferWithTput tries to get terminal content using tput
+func getTerminalBufferWithTput() (string, error) {
+	// This is a limited approach that only works in some terminals
+	// Get terminal size
+	rowsCmd := exec.Command("tput", "lines")
+	rowsOutput, err := rowsCmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get terminal rows: %w", err)
+	}
+	
+	rows, err := strconv.Atoi(strings.TrimSpace(string(rowsOutput)))
+	if err != nil {
+		return "", fmt.Errorf("failed to parse terminal rows: %w", err)
+	}
+	
+	// This is a very limited approach and may not work in all terminals
+	// We can try to use ANSI escape sequences to query the terminal
+	// but this is complex and terminal-dependent
+	
+	// For now, return an error indicating this method is not implemented
+	return "", fmt.Errorf("tput method not fully implemented (terminal has %d rows)", rows)
+}
+
+// runRotateLogs handles the rotate-logs command
+func runRotateLogs(cmd *cobra.Command, args []string) {
+	if proxyLogFile == "" {
+		fmt.Fprintf(os.Stderr, "Error: log file path is required\n")
+		os.Exit(1)
+	}
+	
+	if debug {
+		logDebug("Starting log rotation", map[string]any{
+			"log_file": proxyLogFile,
+		})
+	}
+	
+	// Check if the log file exists
+	if _, err := os.Stat(proxyLogFile); os.IsNotExist(err) {
+		if debug {
+			logDebug("Log file does not exist, nothing to rotate", map[string]any{
+				"log_file": proxyLogFile,
+			})
+		}
+		fmt.Printf("Log file %s does not exist, nothing to rotate\n", proxyLogFile)
+		return
+	}
+	
+	// Perform log rotation
+	if err := logRotator.ForceRotate(proxyLogFile); err != nil {
+		if debug {
+			logDebug("Failed to rotate log file", map[string]any{
+				"error":    err.Error(),
+				"log_file": proxyLogFile,
+			})
+		}
+		fmt.Fprintf(os.Stderr, "Error rotating log file %s: %v\n", proxyLogFile, err)
+		os.Exit(1)
+	}
+	
+	if debug {
+		logDebug("Log rotation completed successfully", map[string]any{
+			"log_file": proxyLogFile,
+		})
+	}
+	
+	// Get backup files to show what was created
+	backups, err := logRotator.GetBackupFiles(proxyLogFile)
+	if err != nil {
+		fmt.Printf("Log file %s rotated successfully\n", proxyLogFile)
+	} else {
+		fmt.Printf("Log file %s rotated successfully. Backup files: %v\n", proxyLogFile, backups)
+	}
+}
+
 

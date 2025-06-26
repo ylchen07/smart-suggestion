@@ -12,7 +12,7 @@ The project includes an automated release workflow (`.github/workflows/release.y
    - Windows (x86_64)
 
 2. **Creates release packages** containing:
-   - Platform-specific binary (`smart-suggestion-fetch`)
+   - Platform-specific binary (`smart-suggestion`)
    - Plugin file (`smart-suggestion.plugin.zsh`)
    - Documentation (`README.md`)
 

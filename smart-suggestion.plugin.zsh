@@ -11,6 +11,10 @@
 (( ! ${+SMART_SUGGESTION_DEBUG} )) &&
     typeset -g SMART_SUGGESTION_DEBUG=false
 
+# Proxy mode configuration - now enabled by default
+(( ! ${+SMART_SUGGESTION_PROXY_MODE} )) &&
+    typeset -g SMART_SUGGESTION_PROXY_MODE=true
+
 # New option to select AI provider
 if [[ -z "$SMART_SUGGESTION_AI_PROVIDER" ]]; then
     if [[ -n "$OPENAI_API_KEY" ]]; then
@@ -29,10 +33,19 @@ if [[ "$SMART_SUGGESTION_DEBUG" == 'true' ]]; then
     touch /tmp/smart-suggestion.log
 fi
 
+function _run_smart_suggestion_proxy() {
+    if [[ $- == *i* ]]; then
+        local binary_path="$HOME/.config/smart-suggestion/smart-suggestion"
+        if [[ ! -f "$binary_path" ]]; then
+            echo "smart-suggestion binary not found at $binary_path. Please run ./build.sh to build it."
+            return 1
+        fi
+        "$binary_path" proxy
+    fi
+}
+
 function _fetch_suggestions() {
-    # Get the directory where the plugin is located
-    local plugin_dir="${0:A:h}"
-    local binary_path="${plugin_dir}/smart-suggestion-fetch"
+    local binary_path="$HOME/.config/smart-suggestion/smart-suggestion"
     
     # Check if the binary exists
     if [[ ! -f "$binary_path" ]]; then
@@ -152,3 +165,6 @@ function smart-suggestion() {
 zle -N _do_smart_suggestion
 bindkey "$SMART_SUGGESTION_KEY" _do_smart_suggestion
 
+if [[ "$SMART_SUGGESTION_PROXY_MODE" == "true" ]]; then
+    _run_smart_suggestion_proxy
+fi

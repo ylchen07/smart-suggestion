@@ -37,11 +37,6 @@ jobs:
             arch: arm64
             goos: darwin
             goarch: arm64
-          - os: windows
-            arch: amd64
-            goos: windows
-            goarch: amd64
-            ext: .exe
 
     steps:
     - name: Checkout code
@@ -62,13 +57,13 @@ jobs:
         CGO_ENABLED: 0
       run: |
         mkdir -p dist
-        go build -ldflags="-w -s" -o dist/smart-suggestion-fetch-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }} ./cmd/main.go
+        go build -ldflags="-w -s" -o dist/smart-suggestion-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }} ./cmd/main.go
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: smart-suggestion-fetch-${{ matrix.os }}-${{ matrix.arch }}
-        path: dist/smart-suggestion-fetch-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}
+        name: smart-suggestion-${{ matrix.os }}-${{ matrix.arch }}
+        path: dist/smart-suggestion-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}
 
   release:
     name: Create Release
@@ -86,34 +81,67 @@ jobs:
     - name: Prepare release assets
       run: |
         mkdir -p release-assets
+        
         # In v4, artifacts are downloaded into subdirectories named after the artifact
-        # Copy binaries from artifact subdirectories
-        find dist -name "smart-suggestion-fetch-*" -type f -exec cp {} release-assets/ \;
+        # Each artifact directory contains the binary file
+        echo "Contents of dist directory:"
+        find dist -type f -ls
+        
+        # Copy binaries from artifact subdirectories to release-assets
+        find dist -name "smart-suggestion-*" -type f -exec cp {} release-assets/ \;
+        
+        # List what we copied
+        echo "Contents of release-assets after copying:"
+        ls -la release-assets/
         
         # Create archive for each platform with plugin files
-        for binary in release-assets/smart-suggestion-fetch-*; do
-          if [[ -f "$binary" ]]; then
-            binary_name=$(basename "$binary")
-            platform_arch=$(echo "$binary_name" | sed 's/smart-suggestion-fetch-//')
-            
-            # Create platform-specific directory
-            mkdir -p "release-assets/smart-suggestion-$platform_arch"
-            cp "$binary" "release-assets/smart-suggestion-$platform_arch/smart-suggestion-fetch"
-            cp smart-suggestion.plugin.zsh "release-assets/smart-suggestion-$platform_arch/"
-            cp README.md "release-assets/smart-suggestion-$platform_arch/"
-            
-            # Create tar.gz archive
-            cd release-assets
-            tar -czf "smart-suggestion-$platform_arch.tar.gz" "smart-suggestion-$platform_arch"
-            cd ..
-            
-            # Clean up directory
-            rm -rf "release-assets/smart-suggestion-$platform_arch"
+        for binary_path in release-assets/smart-suggestion-*; do
+          # Skip if it's a directory or doesn't exist
+          if [[ ! -f "$binary_path" ]]; then
+            echo "Skipping $binary_path (not a file)"
+            continue
           fi
+          
+          binary_name=$(basename "$binary_path")
+          platform_arch=$(echo "$binary_name" | sed 's/smart-suggestion-//')
+          
+          echo "Processing binary: $binary_name for platform: $platform_arch"
+          
+          # Use a temporary directory name to avoid conflicts with binary files
+          temp_dir="release-assets/temp-$platform_arch"
+          
+          # Create platform-specific directory (remove if exists first)
+          rm -rf "$temp_dir"
+          mkdir -p "$temp_dir"
+          
+          # Copy binary and make it executable
+          cp "$binary_path" "$temp_dir/smart-suggestion"
+          chmod +x "$temp_dir/smart-suggestion"
+          
+          # Copy plugin files
+          cp smart-suggestion.plugin.zsh "$temp_dir/"
+          cp README.md "$temp_dir/"
+          
+          # Create tar.gz archive with proper directory name
+          cd release-assets
+          rm -rf "smart-suggestion-$platform_arch"
+          # Rename temp directory to final name for archive
+          mv "temp-$platform_arch" "smart-suggestion-$platform_arch"
+          tar -czf "smart-suggestion-$platform_arch.tar.gz" "smart-suggestion-$platform_arch"
+          cd ..
+          
+          echo "Created archive: smart-suggestion-$platform_arch.tar.gz"
+          
+          # Clean up directory
+          rm -rf "release-assets/smart-suggestion-$platform_arch"
         done
         
         # Remove individual binaries, keep only archives
-        rm -f release-assets/smart-suggestion-fetch-*
+        find release-assets -name "smart-suggestion-*" -type f ! -name "*.tar.gz" -delete
+        
+        # Show final contents
+        echo "Final release assets:"
+        ls -la release-assets/
 
     - name: Create Release
       uses: softprops/action-gh-release@v1

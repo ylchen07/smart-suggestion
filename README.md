@@ -6,14 +6,9 @@ Get AI-powered command suggestions **directly** in your zsh shell. No complex se
 
 ## Features
 
-- **🚀 Instant AI Suggestions**: Get command suggestions with a simple keystroke
+- **🚀 Intelligent Prediction**: Predicts the next command you are likely to input based on context (history, aliases, terminal buffer)
 - **🤖 Multiple AI Providers**: Support for OpenAI GPT, Anthropic Claude, and Google Gemini
-- **🎯 Context-Aware**: Optionally sends shell context (history, aliases, tmux buffer) for better suggestions
-- **⚡ Two Suggestion Modes**:
-  - **Command Completion** (`+` prefix): Complete your current command
-  - **New Command** (`=` prefix): Get a completely new command suggestion
 - **🔧 Highly Configurable**: Customize keybindings, AI provider, context sharing, and more
-- **📊 Debug Support**: Built-in logging for troubleshooting
 
 ## Installation
 
@@ -37,7 +32,7 @@ This script will:
 - Detect your platform (Linux, macOS, Windows)
 - Download the appropriate pre-built binary
 - Install the plugin to `~/.config/smart-suggestion`
-- Configure your `~/.zshrc` automatically
+- Configure your `~/.zshrc` automatically with proxy mode enabled by default
 - Check for zsh-autosuggestions dependency
 
 **Uninstall:**
@@ -156,6 +151,7 @@ Configure the plugin behavior with these environment variables:
 | `SMART_SUGGESTION_AI_PROVIDER` | AI provider to use | Auto-detected | `openai`, `anthropic`, `gemini` |
 | `SMART_SUGGESTION_KEY` | Keybinding to trigger suggestions | `^o` | Any zsh keybinding |
 | `SMART_SUGGESTION_SEND_CONTEXT` | Send shell context to AI | `true` | `true`, `false` |
+| `SMART_SUGGESTION_PROXY_MODE` | Enable proxy mode for better context | `true` | `true`, `false` |
 | `SMART_SUGGESTION_DEBUG` | Enable debug logging | `false` | `true`, `false` |
 | `SMART_SUGGESTION_SYSTEM_PROMPT` | Custom system prompt | Built-in | Any string |
 
@@ -191,6 +187,7 @@ smart-suggestion
 1. **Start typing a command** or describe what you want to do
 2. **Press `CTRL + O`** (or your configured key)
 3. **Wait for the AI suggestion** (loading animation will show)
+   - *Note: On first use, proxy mode will automatically start in the background to capture terminal context*
 4. **The suggestion will appear** as:
    - An autosuggestion you can accept with `→` (for completions)
    - A completely new command that replaces your input (for new commands)
@@ -198,10 +195,27 @@ smart-suggestion
 ## How It Works
 
 1. **Input Capture**: The plugin captures your current command line input
-2. **Context Collection**: If enabled, gathers shell context (user, directory, history, aliases, tmux buffer)
-3. **AI Processing**: Sends the input and context to your configured AI provider
-4. **Smart Response**: AI returns either a completion (`+`) or new command (`=`)
-5. **Shell Integration**: The suggestion is displayed using zsh-autosuggestions or replaces your input
+2. **Proxy Mode (Default)**: Automatically starts a background shell recording session to capture terminal output for better context
+3. **Context Collection**: Gathers rich shell context including user info, directory, command history, aliases, and terminal buffer content via proxy mode
+4. **AI Processing**: Sends the input and context to your configured AI provider
+5. **Smart Response**: AI returns either a completion (`+`) or new command (`=`)
+6. **Shell Integration**: The suggestion is displayed using zsh-autosuggestions or replaces your input
+
+### Proxy Mode (New Default)
+
+Smart Suggestion now automatically enables **proxy mode** by default, which provides significantly better context awareness by recording your terminal session. This mode:
+
+- **Automatically starts** when you first use smart suggestions
+- **Records terminal output** using the `script` command for maximum compatibility
+- **Provides rich context** to the AI including command outputs and error messages
+- **Works seamlessly** across different terminal environments
+
+You can disable proxy mode if needed:
+```bash
+export SMART_SUGGESTION_PROXY_MODE=false
+```
+
+For advanced proxy configuration, see [PROXY_USAGE.md](PROXY_USAGE.md).
 
 ## Troubleshooting
 
@@ -231,7 +245,7 @@ If the build fails:
 go version
 
 # Clean and rebuild
-rm -f smart-suggestion-fetch
+rm -f smart-suggestion
 ./build.sh
 ```
 
