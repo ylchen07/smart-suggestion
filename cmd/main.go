@@ -1,0 +1,779 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+)
+
+// OpenAI API structures
+type OpenAIMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type OpenAIRequest struct {
+	Model    string          `json:"model"`
+	Messages []OpenAIMessage `json:"messages"`
+}
+
+type OpenAIChoice struct {
+	Message OpenAIMessage `json:"message"`
+}
+
+type OpenAIResponse struct {
+	Choices []OpenAIChoice `json:"choices"`
+	Error   *OpenAIError   `json:"error,omitempty"`
+}
+
+type OpenAIError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+}
+
+// Anthropic API structures
+type AnthropicMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type AnthropicRequest struct {
+	Model     string             `json:"model"`
+	MaxTokens int                `json:"max_tokens"`
+	System    string             `json:"system"`
+	Messages  []AnthropicMessage `json:"messages"`
+}
+
+type AnthropicContent struct {
+	Text string `json:"text"`
+	Type string `json:"type"`
+}
+
+type AnthropicResponse struct {
+	Content []AnthropicContent `json:"content"`
+	Type    string             `json:"type"`
+	Error   *AnthropicError    `json:"error,omitempty"`
+}
+
+type AnthropicError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+}
+
+// Gemini API structures
+type GeminiPart struct {
+	Text string `json:"text"`
+}
+
+type GeminiContent struct {
+	Parts []GeminiPart `json:"parts"`
+	Role  string       `json:"role"`
+}
+
+type GeminiRequest struct {
+	Contents []GeminiContent `json:"contents"`
+}
+
+type GeminiCandidate struct {
+	Content GeminiContent `json:"content"`
+}
+
+type GeminiResponse struct {
+	Candidates []GeminiCandidate `json:"candidates"`
+	Error      *GeminiError      `json:"error,omitempty"`
+}
+
+type GeminiError struct {
+	Message string `json:"message"`
+	Code    int    `json:"code"`
+}
+
+// Default system prompt
+const defaultSystemPrompt = `You are a professional SRE engineer with decades of experience, proficient in all shell commands.
+
+Your tasks:
+    - Either complete the command or provide a new command that you think the user is trying to type.
+    - You need to predict what command the user wants to input next based on shell history and shell buffer.
+
+RULES:
+    - If you return a completely new command for the user, prefix is with an equal sign (=).
+    - If you return a completion for the user's command, prefix it with a plus sign (+).
+    - MAKE SURE TO ONLY INCLUDE THE REST OF THE COMPLETION!!!
+    - Do not write any leading or trailing characters except if required for the completion to work.
+    - Only respond with either a completion or a new command, not both.
+    - Your response may only start with either a plus sign or an equal sign.
+    - Your response MAY NOT start with both! This means that your response IS NOT ALLOWED to start with '+=' or '=+'.
+    - Your response MAY NOT contain any newlines!
+    - Do NOT add any additional text, comments, or explanations to your response.
+    - Do not ask for more information, you won't receive it.
+    - Your response will be run in the user's shell.
+    - Make sure input is escaped correctly if needed so.
+    - Your input should be able to run without any modifications to it.
+    - DO NOT INTERACT WITH THE USER IN NATURAL LANGUAGE! If you do, you will be banned from the system.
+    - Note that the double quote sign is escaped. Keep this in mind when you create quotes.
+
+Examples: 
+    * User input: 'list files in current directory'; Your response: '=ls' (ls is the builtin command for listing files)
+    * User input: 'cd /tm'; Your response: '+p' (/tmp is the standard temp folder on linux and mac).
+    * Shell history: 'ls -l /tmp/smart-suggestion.log'; Your response: '=cat /tmp/smart-suggestion.log' (cat is the builtin command for concatenating files)
+    * Shell buffer:
+        # k -n my-namespace get pod
+        NAME           READY   STATUS             RESTARTS         AGE
+        pod-name-aaa   2/3     CrashLoopBackOff   358 (111s ago)   30h
+        pod-name-bbb   2/3     CrashLoopBackOff   358 (3m8s ago)   30h
+      Your response: '=kubectl -n my-namespace describe pod pod-name-aaa --show-events' (kubectl is the command for interacting with kubernetes)
+    * Shell buffer:
+        # k get node
+        NAME      STATUS   ROLES    AGE   VERSION
+        node-aaa  Ready    <none>   3h    v1.25.3
+        node-bbb  NotReady <none>   3h    v1.25.3
+      Your response: '=kubectl describe node node-bbb' (kubectl is the command for interacting with kubernetes)`
+
+var (
+	provider      string
+	input         string
+	systemPrompt  string
+	debug         bool
+	outputFile    string
+	sendContext   bool
+)
+
+func main() {
+	var rootCmd = &cobra.Command{
+		Use:   "smart-suggestion-fetch",
+		Short: "Fetch AI suggestions for zsh",
+		Run:   runFetch,
+	}
+
+	rootCmd.Flags().StringVarP(&provider, "provider", "p", "", "AI provider (openai or anthropic)")
+	rootCmd.Flags().StringVarP(&input, "input", "i", "", "User input")
+	rootCmd.Flags().StringVarP(&systemPrompt, "system", "s", "", "System prompt (optional, uses default if not provided)")
+	rootCmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
+	rootCmd.Flags().StringVarP(&outputFile, "output", "o", "/tmp/smart_suggestion", "Output file path")
+	rootCmd.Flags().BoolVarP(&sendContext, "context", "c", false, "Include context information")
+
+	rootCmd.MarkFlagRequired("provider")
+	rootCmd.MarkFlagRequired("input")
+
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runFetch(cmd *cobra.Command, args []string) {
+	if systemPrompt == "" {
+		systemPrompt = defaultSystemPrompt
+	}
+	// Build the complete prompt with context if requested
+	completePrompt := systemPrompt
+	if sendContext {
+		contextInfo, err := buildContextInfo()
+		if err != nil {
+			if debug {
+				logDebug("Failed to build context info", map[string]any{
+					"error": err.Error(),
+				})
+			}
+			// Continue without context if there's an error
+		} else {
+			completePrompt = systemPrompt + "\n\n" + contextInfo
+		}
+	}
+
+	// Update the global systemPrompt for API calls
+	systemPrompt = completePrompt
+
+	var suggestion string
+	var err error
+
+	switch strings.ToLower(provider) {
+	case "openai":
+		suggestion, err = fetchOpenAI()
+	case "anthropic":
+		suggestion, err = fetchAnthropic()
+	case "gemini":
+		suggestion, err = fetchGemini()
+	default:
+		err = fmt.Errorf("unsupported provider: %s", provider)
+	}
+
+	if err != nil {
+		if debug {
+			logDebug("Error occurred", map[string]any{
+				"error":    err.Error(),
+				"provider": provider,
+				"input":    input,
+			})
+		}
+		
+		errorMsg := fmt.Sprintf("Error fetching suggestions from %s API: %v", provider, err)
+		if err := os.WriteFile("/tmp/.smart_suggestion_error", []byte(errorMsg), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to write error file: %v\n", err)
+		}
+		os.Exit(1)
+	}
+
+	if debug {
+		logDebug("Successfully fetched suggestion", map[string]any{
+			"provider":   provider,
+			"input":      input,
+			"suggestion": suggestion,
+		})
+	}
+
+	if err := os.WriteFile(outputFile, []byte(suggestion), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to write suggestion to file: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func fetchOpenAI() (string, error) {
+	apiKey := os.Getenv("OPENAI_API_KEY")
+	if apiKey == "" {
+		return "", fmt.Errorf("OPENAI_API_KEY environment variable is not set")
+	}
+
+	apiURL := os.Getenv("OPENAI_API_URL")
+	if apiURL == "" {
+		apiURL = "api.openai.com"
+	}
+
+	url := fmt.Sprintf("https://%s/v1/chat/completions", apiURL)
+
+	request := OpenAIRequest{
+		Model: "gpt-4o-mini",
+		Messages: []OpenAIMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: input},
+		},
+	}
+
+	jsonData, err := json.Marshal(request)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	if debug {
+		logDebug("Sending OpenAI request", map[string]any{
+			"url":     url,
+			"request": string(jsonData),
+		})
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if debug {
+		logDebug("Received OpenAI response", map[string]any{
+			"status":   resp.Status,
+			"response": string(body),
+		})
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var response OpenAIResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return "", fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	if response.Error != nil {
+		return "", fmt.Errorf("OpenAI API error: %s", response.Error.Message)
+	}
+
+	if len(response.Choices) == 0 {
+		return "", fmt.Errorf("no choices returned from OpenAI API")
+	}
+
+	return response.Choices[0].Message.Content, nil
+}
+
+func fetchAnthropic() (string, error) {
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		return "", fmt.Errorf("ANTHROPIC_API_KEY environment variable is not set")
+	}
+
+	apiURL := os.Getenv("ANTHROPIC_API_URL")
+	if apiURL == "" {
+		apiURL = "api.anthropic.com"
+	}
+
+	url := fmt.Sprintf("https://%s/v1/messages", apiURL)
+
+	request := AnthropicRequest{
+		Model:     "claude-3-5-sonnet-20241022",
+		MaxTokens: 1000,
+		System:    systemPrompt,
+		Messages: []AnthropicMessage{
+			{Role: "user", Content: input},
+		},
+	}
+
+	jsonData, err := json.Marshal(request)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	if debug {
+		logDebug("Sending Anthropic request", map[string]any{
+			"url":     url,
+			"request": string(jsonData),
+		})
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if debug {
+		logDebug("Received Anthropic response", map[string]any{
+			"status":   resp.Status,
+			"response": string(body),
+		})
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var response AnthropicResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return "", fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	if response.Type == "error" || response.Error != nil {
+		errorMsg := "unknown error"
+		if response.Error != nil {
+			errorMsg = response.Error.Message
+		}
+		return "", fmt.Errorf("Anthropic API error: %s", errorMsg)
+	}
+
+	if len(response.Content) == 0 {
+		return "", fmt.Errorf("no content returned from Anthropic API")
+	}
+
+	return response.Content[0].Text, nil
+}
+
+func logDebug(message string, data map[string]any) {
+	logEntry := map[string]any{
+		"date":    time.Now().Format(time.RFC3339),
+		"log":     message,
+	}
+	
+	for k, v := range data {
+		logEntry[k] = v
+	}
+
+	jsonData, err := json.Marshal(logEntry)
+	if err != nil {
+		log.Printf("Failed to marshal debug log: %v", err)
+		return
+	}
+
+	file, err := os.OpenFile("/tmp/smart-suggestion.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("Failed to open debug log file: %v", err)
+		return
+	}
+	defer file.Close()
+
+	file.WriteString(string(jsonData) + "\n")
+}
+
+// buildContextInfo builds context information similar to the zsh plugin
+func buildContextInfo() (string, error) {
+	var contextParts []string
+	
+	// Get user information
+	currentUser := os.Getenv("USER")
+	if currentUser == "" {
+		currentUser = "unknown"
+	}
+	
+	// Get current directory
+	currentDir, err := os.Getwd()
+	if err != nil {
+		currentDir = "unknown"
+	}
+	
+	// Get shell information
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "unknown"
+	}
+	
+	// Get terminal information
+	term := os.Getenv("TERM")
+	if term == "" {
+		term = "unknown"
+	}
+	
+	// Get system information
+	systemInfo, err := getSystemInfo()
+	if err != nil {
+		if debug {
+			logDebug("Failed to get system info", map[string]any{
+				"error": err.Error(),
+			})
+		}
+		systemInfo = "unknown system"
+	}
+	
+	// Get user ID information
+	userID, err := getUserID()
+	if err != nil {
+		if debug {
+			logDebug("Failed to get user ID", map[string]any{
+				"error": err.Error(),
+			})
+		}
+		userID = "unknown"
+	}
+	
+	// Get uname information
+	unameInfo, err := getUnameInfo()
+	if err != nil {
+		if debug {
+			logDebug("Failed to get uname info", map[string]any{
+				"error": err.Error(),
+			})
+		}
+		unameInfo = "unknown"
+	}
+	
+	// Build the basic context
+	basicContext := fmt.Sprintf("# Context:\nYou are user %s with id %s in directory %s. Your shell is %s and your terminal is %s running on %s. %s",
+		currentUser, userID, currentDir, shell, term, unameInfo, systemInfo)
+	contextParts = append(contextParts, basicContext)
+	
+	// Get aliases
+	aliases, err := getAliases()
+	if err != nil {
+		if debug {
+			logDebug("Failed to get aliases", map[string]any{
+				"error": err.Error(),
+			})
+		}
+	} else {
+		contextParts = append(contextParts, "\n# This is the alias defined in your shell:\n", aliases)
+	}
+
+	shellHistory, err := getShellHistory()
+	if err != nil {
+		if debug {
+			logDebug("Failed to get shell history", map[string]any{
+				"error": err.Error(),
+			})
+		}
+	} else {
+		contextParts = append(contextParts, "\n# Shell history:\n", shellHistory)
+	}
+	
+	// Get tmux buffer content if available
+	shellBuffer, err := getShellBuffer()
+	if err != nil {
+		if debug {
+			logDebug("Failed to get shell buffer", map[string]any{
+				"error": err.Error(),
+			})
+		}
+	} else {
+		contextParts = append(contextParts, "\n# Shell buffer:\n", shellBuffer)
+	}
+	
+	return strings.Join(contextParts, ""), nil
+}
+
+// getSystemInfo gets system information similar to the zsh plugin
+func getSystemInfo() (string, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		// macOS: use sw_vers command
+		cmd := exec.Command("sw_vers")
+		output, err := cmd.Output()
+		if err != nil {
+			return "", fmt.Errorf("failed to run sw_vers: %w", err)
+		}
+		
+		// Process output similar to: $(sw_vers | xargs | sed 's/ /./g')
+		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+		var parts []string
+		for _, line := range lines {
+			parts = append(parts, strings.ReplaceAll(line, " ", "."))
+		}
+		return fmt.Sprintf("Your system is %s.", strings.Join(parts, ".")), nil
+		
+	default:
+		// Linux and others: read /etc/*-release files
+		releaseFiles := []string{"/etc/os-release", "/etc/lsb-release", "/etc/redhat-release"}
+		var content []string
+		
+		for _, file := range releaseFiles {
+			data, err := os.ReadFile(file)
+			if err == nil {
+				content = append(content, string(data))
+			}
+		}
+		
+		if len(content) == 0 {
+			return "", fmt.Errorf("no release files found")
+		}
+		
+		// Process similar to: $(cat /etc/*-release | xargs | sed 's/ /,/g')
+		allContent := strings.Join(content, " ")
+		processedContent := strings.ReplaceAll(strings.TrimSpace(allContent), " ", ",")
+		return fmt.Sprintf("Your system is %s.", processedContent), nil
+	}
+}
+
+// getUserID gets user ID information
+func getUserID() (string, error) {
+	cmd := exec.Command("id")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to run id command: %w", err)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func fetchGemini() (string, error) {
+	apiKey := os.Getenv("GEMINI_API_KEY")
+	if apiKey == "" {
+		return "", fmt.Errorf("GEMINI_API_KEY environment variable is not set")
+	}
+
+	apiURL := os.Getenv("GEMINI_API_URL")
+	if apiURL == "" {
+		apiURL = "generativelanguage.googleapis.com"
+	}
+
+	model := os.Getenv("GEMINI_MODEL")
+	if model == "" {
+		model = "gemini-2.5-flash"
+	}
+
+	url := fmt.Sprintf("https://%s/v1beta/models/%s:generateContent?key=%s", apiURL, model, apiKey)
+
+	// Gemini API expects a different format - system prompt and user input are combined
+	var contents []GeminiContent
+	
+	// Add system prompt as user message (Gemini doesn't have separate system role)
+	if systemPrompt != "" {
+		contents = append(contents, GeminiContent{
+			Parts: []GeminiPart{{Text: systemPrompt}},
+			Role:  "user",
+		})
+		contents = append(contents, GeminiContent{
+			Parts: []GeminiPart{{Text: "I understand. I'll follow these instructions."}},
+			Role:  "model",
+		})
+	}
+	
+	// Add user input
+	contents = append(contents, GeminiContent{
+		Parts: []GeminiPart{{Text: input}},
+		Role:  "user",
+	})
+
+	request := GeminiRequest{
+		Contents: contents,
+	}
+
+	jsonData, err := json.Marshal(request)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	if debug {
+		logDebug("Sending Gemini request", map[string]any{
+			"url":     url,
+			"request": string(jsonData),
+		})
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if debug {
+		logDebug("Received Gemini response", map[string]any{
+			"status":   resp.Status,
+			"response": string(body),
+		})
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var response GeminiResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return "", fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	if response.Error != nil {
+		return "", fmt.Errorf("Gemini API error: %s", response.Error.Message)
+	}
+
+	if len(response.Candidates) == 0 {
+		return "", fmt.Errorf("no candidates returned from Gemini API")
+	}
+
+	if len(response.Candidates[0].Content.Parts) == 0 {
+		return "", fmt.Errorf("no content parts returned from Gemini API")
+	}
+
+	return response.Candidates[0].Content.Parts[0].Text, nil
+}
+
+// getUnameInfo gets uname information
+func getUnameInfo() (string, error) {
+	cmd := exec.Command("uname", "-a")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to run uname command: %w", err)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// getAliases gets shell aliases
+func getAliases() (string, error) {
+	// Try to get aliases using the alias command
+	cmd := exec.Command("alias")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get aliases: %w", err)
+	}
+	
+	// No need to escape quotes here as Go handles JSON encoding properly
+	return strings.TrimSpace(string(output)), nil
+}
+
+func getShellHistory() (string, error) {
+	// Get the number of lines to fetch
+	numLinesStr := os.Getenv("SMART_SUGGESTION_HISTORY_LINES")
+	if numLinesStr == "" {
+		numLinesStr = "10"
+	}
+
+	// Get the number of lines to fetch
+	numLines, err := strconv.Atoi(numLinesStr)
+	if err != nil {
+		return "", fmt.Errorf("SMART_SUGGESTION_HISTORY_LINES is not a valid number: %w", err)
+	}
+
+	// Get the shell history file path
+	historyFile := os.Getenv("HISTFILE")
+	if historyFile == "" {
+		historyFile = "~/.zsh_history"
+	}
+
+	// Read the history file
+	file, err := os.Open(historyFile)
+	if err != nil {
+		return "", fmt.Errorf("failed to open history file: %w", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Split(bufio.ScanLines)
+
+	var historyLines []string
+	for i := 0; i < numLines; i++ {
+		if !scanner.Scan() {
+			break
+		}
+		historyLines = append(historyLines, scanner.Text())
+	}
+
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("failed to read history file: %w", err)
+	}
+
+	return strings.Join(historyLines, "\n"), nil
+}
+
+// getShellBuffer gets tmux buffer content
+func getShellBuffer() (string, error) {
+	// Check if we're in a tmux session
+	if os.Getenv("TMUX") == "" {
+		return "", fmt.Errorf("not in a tmux session")
+	}
+	
+	cmd := exec.Command("tmux", "capture-pane", "-pS", "-")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to capture tmux pane: %w", err)
+	}
+	
+	// No need to escape quotes here as Go handles JSON encoding properly
+	return strings.TrimSpace(string(output)), nil
+}
+

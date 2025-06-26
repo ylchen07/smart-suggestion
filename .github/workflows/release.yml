@@ -1,0 +1,156 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            goos: linux
+            goarch: amd64
+          - os: linux
+            arch: arm64
+            goos: linux
+            goarch: arm64
+          - os: darwin
+            arch: amd64
+            goos: darwin
+            goarch: amd64
+          - os: darwin
+            arch: arm64
+            goos: darwin
+            goarch: arm64
+          - os: windows
+            arch: amd64
+            goos: windows
+            goarch: amd64
+            ext: .exe
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+
+    - name: Get dependencies
+      run: go mod download
+
+    - name: Build binary
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+        CGO_ENABLED: 0
+      run: |
+        mkdir -p dist
+        go build -ldflags="-w -s" -o dist/smart-suggestion-fetch-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }} ./cmd/main.go
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: smart-suggestion-fetch-${{ matrix.os }}-${{ matrix.arch }}
+        path: dist/smart-suggestion-fetch-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist
+
+    - name: Prepare release assets
+      run: |
+        mkdir -p release-assets
+        # In v4, artifacts are downloaded into subdirectories named after the artifact
+        # Copy binaries from artifact subdirectories
+        find dist -name "smart-suggestion-fetch-*" -type f -exec cp {} release-assets/ \;
+        
+        # Create archive for each platform with plugin files
+        for binary in release-assets/smart-suggestion-fetch-*; do
+          if [[ -f "$binary" ]]; then
+            binary_name=$(basename "$binary")
+            platform_arch=$(echo "$binary_name" | sed 's/smart-suggestion-fetch-//')
+            
+            # Create platform-specific directory
+            mkdir -p "release-assets/smart-suggestion-$platform_arch"
+            cp "$binary" "release-assets/smart-suggestion-$platform_arch/smart-suggestion-fetch"
+            cp smart-suggestion.plugin.zsh "release-assets/smart-suggestion-$platform_arch/"
+            cp README.md "release-assets/smart-suggestion-$platform_arch/"
+            
+            # Create tar.gz archive
+            cd release-assets
+            tar -czf "smart-suggestion-$platform_arch.tar.gz" "smart-suggestion-$platform_arch"
+            cd ..
+            
+            # Clean up directory
+            rm -rf "release-assets/smart-suggestion-$platform_arch"
+          fi
+        done
+        
+        # Remove individual binaries, keep only archives
+        rm -f release-assets/smart-suggestion-fetch-*
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+        name: Release ${{ github.event.inputs.tag || github.ref_name }}
+        draft: false
+        prerelease: false
+        files: |
+          release-assets/*.tar.gz
+          install.sh
+        body: |
+          ## Smart Suggestion Release ${{ github.event.inputs.tag || github.ref_name }}
+          
+          ### Installation
+          
+          **Quick Install (Recommended):**
+          ```bash
+          curl -fsSL https://raw.githubusercontent.com/yetone/smart-suggestion/${{ github.event.inputs.tag || github.ref_name }}/install.sh | bash
+          ```
+          
+          **Manual Install:**
+          1. Download the appropriate archive for your platform
+          2. Extract it to your desired location
+          3. Follow the setup instructions in the README.md
+          
+          ### Supported Platforms
+          - Linux (x86_64, ARM64)
+          - macOS (Intel, Apple Silicon)
+          - Windows (x86_64)
+          
+          ### Changes
+          See the commit history for detailed changes in this release.
+          
+          ### Requirements
+          - zsh shell
+          - zsh-autosuggestions plugin
+          - API key for OpenAI, Anthropic, or Google Gemini
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
