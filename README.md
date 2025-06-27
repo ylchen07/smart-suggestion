@@ -23,7 +23,7 @@ https://github.com/user-attachments/assets/90eaf300-c891-4ef9-958d-9890f53f9929
 ## Questions
 * Why don't I use [zsh-copilot](https://github.com/Myzel394/zsh-copilot) and instead fork a separate version?
 
-    Because the context of zsh-copilot only includes history commands and does not include the terminal buffer (i.e., the stdout/stderr of history commands), it cannot achieve the context-aware intelligent prediction I want. Additionally, since zsh-copilot is written in shell, it's very difficult to concatenate JSON and implement stdio interception. Therefore, I re-implemented almost all logic using Go, which made it too different from the original project to merge back.
+    Because the context of zsh-copilot only includes history commands and does not include the terminal buffer (i.e., the stdout/stderr of history commands), it cannot achieve the context-aware intelligent prediction I want, this is the feature I want the most, and it's also the main reason why I forked. Additionally, since zsh-copilot is written in shell, it's very difficult to concatenate JSON and implement stdio interception. Therefore, I re-implemented almost all logic using Go, which made it too different from the original project to merge back.
 
 ## Installation
 
