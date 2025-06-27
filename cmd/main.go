@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -169,6 +171,7 @@ var (
 	sendContext   bool
 	proxyMode     bool
 	proxyLogFile  string
+	sessionID     string
 	
 	// Global log rotator instance
 	logRotator *pkg.LogRotator
@@ -218,6 +221,7 @@ func main() {
 
 	// Proxy command flags
 	proxyCmd.Flags().StringVarP(&proxyLogFile, "log-file", "l", "/tmp/smart_suggestion_proxy.log", "Proxy log file path")
+	proxyCmd.Flags().StringVarP(&sessionID, "session-id", "", "", "Session ID for log isolation (auto-generated if not provided)")
 	proxyCmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
 
 	// Rotate-logs command flags
@@ -902,16 +906,206 @@ func cleanupProcessLock(file *os.File, lockPath string) {
 	os.Remove(lockPath)
 }
 
+// generateSessionID generates a unique session ID
+func generateSessionID() (string, error) {
+	// Generate random bytes
+	randomBytes := make([]byte, 8)
+	if _, err := rand.Read(randomBytes); err != nil {
+		return "", fmt.Errorf("failed to generate random bytes: %w", err)
+	}
+	
+	// Create session ID with PID and timestamp for uniqueness
+	pid := os.Getpid()
+	timestamp := time.Now().Unix()
+	randomHex := hex.EncodeToString(randomBytes)
+	
+	sessionID := fmt.Sprintf("%d_%d_%s", pid, timestamp, randomHex)
+	return sessionID, nil
+}
+
+// getSessionBasedLogFile returns the session-specific log file path
+func getSessionBasedLogFile(baseLogFile, sessionID string) string {
+	if sessionID == "" {
+		return baseLogFile
+	}
+	
+	// Extract directory and base filename
+	dir := filepath.Dir(baseLogFile)
+	base := filepath.Base(baseLogFile)
+	
+	// Remove extension if present
+	ext := filepath.Ext(base)
+	if ext != "" {
+		base = strings.TrimSuffix(base, ext)
+	}
+	
+	// Create session-specific filename
+	sessionLogFile := fmt.Sprintf("%s.%s%s", base, sessionID, ext)
+	return filepath.Join(dir, sessionLogFile)
+}
+
+// getSessionBasedLockFile returns the session-specific lock file path
+func getSessionBasedLockFile(baseLockFile, sessionID string) string {
+	if sessionID == "" {
+		return baseLockFile
+	}
+	
+	dir := filepath.Dir(baseLockFile)
+	base := filepath.Base(baseLockFile)
+	ext := filepath.Ext(base)
+	if ext != "" {
+		base = strings.TrimSuffix(base, ext)
+	}
+	
+	sessionLockFile := fmt.Sprintf("%s.%s%s", base, sessionID, ext)
+	return filepath.Join(dir, sessionLockFile)
+}
+
+// getCurrentSessionID gets the current session ID from environment or generates one
+func getCurrentSessionID() string {
+	// Try to get from environment variable first
+	if sessionID := os.Getenv("SMART_SUGGESTION_SESSION_ID"); sessionID != "" {
+		return sessionID
+	}
+	
+	// Try to get from TTY device name
+	if ttyName := getTTYName(); ttyName != "" {
+		return ttyName
+	}
+	
+	// Generate a new one based on PID
+	return fmt.Sprintf("pid_%d", os.Getpid())
+}
+
+// getTTYName gets the current TTY device name for session identification
+func getTTYName() string {
+	// Try to get TTY name from various sources
+	if tty := os.Getenv("TTY"); tty != "" {
+		// Extract just the device name
+		if parts := strings.Split(tty, "/"); len(parts) > 0 {
+			return strings.ReplaceAll(parts[len(parts)-1], ".", "_")
+		}
+	}
+	
+	// Try to get from tty command
+	cmd := exec.Command("tty")
+	output, err := cmd.Output()
+	if err == nil {
+		ttyPath := strings.TrimSpace(string(output))
+		if parts := strings.Split(ttyPath, "/"); len(parts) > 0 {
+			deviceName := parts[len(parts)-1]
+			// Replace special characters to make it filesystem-safe
+			deviceName = strings.ReplaceAll(deviceName, ".", "_")
+			deviceName = strings.ReplaceAll(deviceName, ":", "_")
+			return deviceName
+		}
+	}
+	
+	return ""
+}
+
+// cleanupOldSessionLogs removes old session log files
+func cleanupOldSessionLogs(baseLogPath string, maxAge time.Duration) error {
+	dir := filepath.Dir(baseLogPath)
+	base := filepath.Base(baseLogPath)
+	
+	// Remove extension for pattern matching
+	ext := filepath.Ext(base)
+	if ext != "" {
+		base = strings.TrimSuffix(base, ext)
+	}
+	
+	// Pattern to match session log files
+	pattern := fmt.Sprintf("%s.*%s", base, ext)
+	
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("failed to read directory %s: %w", dir, err)
+	}
+	
+	cutoff := time.Now().Add(-maxAge)
+	var removedFiles []string
+	
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		
+		filename := entry.Name()
+		// Check if this looks like a session log file
+		if matched, _ := filepath.Match(pattern, filename); !matched {
+			continue
+		}
+		
+		// Skip the base file itself
+		if filename == filepath.Base(baseLogPath) {
+			continue
+		}
+		
+		fullPath := filepath.Join(dir, filename)
+		info, err := os.Stat(fullPath)
+		if err != nil {
+			continue
+		}
+		
+		// Remove if older than cutoff
+		if info.ModTime().Before(cutoff) {
+			if err := os.Remove(fullPath); err == nil {
+				removedFiles = append(removedFiles, filename)
+			}
+		}
+	}
+	
+	if len(removedFiles) > 0 && debug {
+		logDebug("Cleaned up old session logs", map[string]any{
+			"removed_files": removedFiles,
+			"base_path":     baseLogPath,
+		})
+	}
+	
+	return nil
+}
+
 // runProxy starts the shell proxy mode using PTY
 func runProxy(cmd *cobra.Command, args []string) {
-	// Create a lock file to prevent duplicate proxy processes
-	lockPath := "/tmp/smart-suggestion-proxy.lock"
-	lockFile, err := createProcessLock(lockPath)
+	// Check if we're already inside a proxy session to prevent nesting
+	if os.Getenv("SMART_SUGGESTION_PROXY_ACTIVE") != "" {
+		if debug {
+			logDebug("Already inside a proxy session, preventing nesting", map[string]any{
+				"existing_proxy_pid": os.Getenv("SMART_SUGGESTION_PROXY_ACTIVE"),
+			})
+		}
+		return
+	}
+
+	// Generate or get session ID
+	if sessionID == "" {
+		// Auto-generate session ID if not provided
+		generatedID, err := generateSessionID()
+		if err != nil {
+			if debug {
+				logDebug("Failed to generate session ID", map[string]any{
+					"error": err.Error(),
+				})
+			}
+			fmt.Fprintf(os.Stderr, "Failed to generate session ID: %v\n", err)
+			os.Exit(1)
+		}
+		sessionID = generatedID
+	}
+
+	// Create session-based file paths
+	sessionLogFile := getSessionBasedLogFile(proxyLogFile, sessionID)
+	sessionLockFile := getSessionBasedLockFile("/tmp/smart-suggestion-proxy.lock", sessionID)
+	
+	// Create a lock file to prevent duplicate proxy processes for this session
+	lockFile, err := createProcessLock(sessionLockFile)
 	if err != nil {
 		if debug {
 			logDebug("Failed to create process lock", map[string]any{
-				"error":     err.Error(),
-				"lock_path": lockPath,
+				"error":      err.Error(),
+				"lock_path":  sessionLockFile,
+				"session_id": sessionID,
 			})
 		}
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -919,13 +1113,29 @@ func runProxy(cmd *cobra.Command, args []string) {
 	}
 	
 	// Ensure cleanup on exit
-	defer cleanupProcessLock(lockFile, lockPath)
+	defer cleanupProcessLock(lockFile, sessionLockFile)
+	
+	// Set environment variables for child processes
+	os.Setenv("SMART_SUGGESTION_SESSION_ID", sessionID)
+	// Set proxy active flag with current PID to prevent nesting
+	os.Setenv("SMART_SUGGESTION_PROXY_ACTIVE", fmt.Sprintf("%d", os.Getpid()))
+	
+	// Clean up old session logs (older than 24 hours)
+	if err := cleanupOldSessionLogs(proxyLogFile, 24*time.Hour); err != nil {
+		if debug {
+			logDebug("Failed to cleanup old session logs", map[string]any{
+				"error": err.Error(),
+			})
+		}
+		// Continue even if cleanup fails
+	}
 	
 	if debug {
 		logDebug("Starting shell proxy mode with PTY", map[string]any{
-			"log_file":  proxyLogFile,
-			"lock_file": lockPath,
-			"pid":       os.Getpid(),
+			"log_file":        sessionLogFile,
+			"lock_file":       sessionLockFile,
+			"session_id":      sessionID,
+			"pid":             os.Getpid(),
 		})
 	}
 	
@@ -995,30 +1205,32 @@ func runProxy(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// try to delete log file if it exists
-	if _, err := os.Stat(proxyLogFile); err == nil {
-		if err := os.Remove(proxyLogFile); err != nil {
+	// try to delete session log file if it exists
+	if _, err := os.Stat(sessionLogFile); err == nil {
+		if err := os.Remove(sessionLogFile); err != nil {
 			if debug {
-				logDebug("Failed to delete log file", map[string]any{
-					"error":    err.Error(),
-					"log_file": proxyLogFile,
+				logDebug("Failed to delete session log file", map[string]any{
+					"error":      err.Error(),
+					"log_file":   sessionLogFile,
+					"session_id": sessionID,
 				})
 			}
-			fmt.Fprintf(os.Stderr, "Failed to delete log file: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to delete session log file: %v\n", err)
 			os.Exit(1)
 		}
 	}
 	
-	// Open log file for writing
-	logFile, err := os.OpenFile(proxyLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	// Open session log file for writing
+	logFile, err := os.OpenFile(sessionLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		if debug {
-			logDebug("Failed to open log file", map[string]any{
-				"error":    err.Error(),
-				"log_file": proxyLogFile,
+			logDebug("Failed to open session log file", map[string]any{
+				"error":      err.Error(),
+				"log_file":   sessionLogFile,
+				"session_id": sessionID,
 			})
 		}
-		fmt.Fprintf(os.Stderr, "Failed to open log file: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to open session log file: %v\n", err)
 		os.Exit(1)
 	}
 	defer logFile.Close()
@@ -1089,14 +1301,31 @@ func getShellBuffer() (string, error) {
 		}
 	}
 	
-	// Try to read from proxy log file if it exists
+	// Try to read from session-specific proxy log file if it exists
+	currentSessionID := getCurrentSessionID()
+	if currentSessionID != "" && proxyLogFile != "" {
+		sessionLogFile := getSessionBasedLogFile(proxyLogFile, currentSessionID)
+		content, err := readLatestProxyContent(sessionLogFile)
+		if err == nil {
+			return content, nil
+		}
+		if debug {
+			logDebug("Failed to read session proxy log", map[string]any{
+				"error":      err.Error(),
+				"file":       sessionLogFile,
+				"session_id": currentSessionID,
+			})
+		}
+	}
+	
+	// Fallback to base proxy log file if session-specific file doesn't exist
 	if proxyLogFile != "" {
 		content, err := readLatestProxyContent(proxyLogFile)
 		if err == nil {
 			return content, nil
 		}
 		if debug {
-			logDebug("Failed to read proxy log", map[string]any{
+			logDebug("Failed to read base proxy log", map[string]any{
 				"error": err.Error(),
 				"file":  proxyLogFile,
 			})
