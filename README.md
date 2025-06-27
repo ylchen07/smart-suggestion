@@ -7,12 +7,10 @@
 Get AI-powered command suggestions **directly** in your zsh shell. No complex setup, no external tools - just press `CTRL + O` and get intelligent command suggestions powered by OpenAI, Anthropic Claude, or Google Gemini.
 
 > [!NOTE]
-> 
+>
 > This project is still in its early stages, and some features may be immature and unstable. I appreciate your understanding.
 
-
-https://github.com/user-attachments/assets/90eaf300-c891-4ef9-958d-9890f53f9929
-
+<https://github.com/user-attachments/assets/90eaf300-c891-4ef9-958d-9890f53f9929>
 
 ## Features
 
@@ -39,6 +37,7 @@ curl -fsSL https://raw.githubusercontent.com/yetone/smart-suggestion/main/instal
 ```
 
 This script will:
+
 - Detect your platform (Linux, macOS, Windows)
 - Download the appropriate pre-built binary
 - Install the plugin to `~/.config/smart-suggestion`
@@ -46,6 +45,7 @@ This script will:
 - Check for zsh-autosuggestions dependency
 
 **Uninstall:**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yetone/smart-suggestion/main/install.sh | bash -s -- --uninstall
 ```
@@ -138,16 +138,28 @@ source ~/.zshrc
 You need an API key for at least one of the supported AI providers:
 
 #### OpenAI (default)
+
 ```bash
 export OPENAI_API_KEY="your-openai-api-key"
 ```
 
+#### Azure OpenAI
+
+```bash
+export AZURE_OPENAI_API_KEY="your-azure-openai-api-key" # i.e. c0123456789012345678901234567890
+export AZURE_OPENAI_RESOURCE_NAME="your-azure-openai-resource-name" # i.e. awesome-corp when your endpoint is https://awesome-corp.openai.azure.com
+export AZURE_OPENAI_DEPLOYMENT_NAME="your-deployment-name" # i.e. gpt-4o
+export AZURE_OPENAI_API_VERSION="2024-10-21"  # Optional, defaults to 2024-10-21
+```
+
 #### Anthropic Claude
+
 ```bash
 export ANTHROPIC_API_KEY="your-anthropic-api-key"
 ```
 
 #### Google Gemini
+
 ```bash
 export GEMINI_API_KEY="your-gemini-api-key"
 ```
@@ -158,7 +170,7 @@ Configure the plugin behavior with these environment variables:
 
 | Variable | Description | Default | Options |
 |----------|-------------|---------|---------|
-| `SMART_SUGGESTION_AI_PROVIDER` | AI provider to use | Auto-detected | `openai`, `anthropic`, `gemini` |
+| `SMART_SUGGESTION_AI_PROVIDER` | AI provider to use | Auto-detected | `openai`, `azure_openai`, `anthropic`, `gemini` |
 | `SMART_SUGGESTION_KEY` | Keybinding to trigger suggestions | `^o` | Any zsh keybinding |
 | `SMART_SUGGESTION_SEND_CONTEXT` | Send shell context to AI | `true` | `true`, `false` |
 | `SMART_SUGGESTION_PROXY_MODE` | Enable proxy mode for better context | `true` | `true`, `false` |
@@ -168,6 +180,7 @@ Configure the plugin behavior with these environment variables:
 ### Advanced Configuration
 
 #### Custom API URLs
+
 ```bash
 export OPENAI_API_URL="your-custom-openai-endpoint.com"
 export ANTHROPIC_API_URL="your-custom-anthropic-endpoint.com"
@@ -175,11 +188,13 @@ export GEMINI_API_URL="your-custom-gemini-endpoint.com"
 ```
 
 #### Custom Models
+
 ```bash
 export GEMINI_MODEL="gemini-1.5-pro"  # Default: gemini-1.5-flash
 ```
 
 #### History Lines for Context
+
 ```bash
 export SMART_SUGGESTION_HISTORY_LINES="20"  # Default: 10
 ```
@@ -221,6 +236,7 @@ Smart Suggestion now automatically enables **proxy mode** by default, which prov
 - **Works seamlessly** across different terminal environments
 
 You can disable proxy mode if needed:
+
 ```bash
 export SMART_SUGGESTION_PROXY_MODE=false
 ```
@@ -266,4 +282,3 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 ## License
 
 This project is open source. Please check the repository for license details.
-
