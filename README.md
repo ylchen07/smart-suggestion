@@ -1,8 +1,14 @@
 # Smart Suggestion for Zsh
 
+> [!NOTE]
+>
 > This project is a fork of [zsh-copilot](https://github.com/Myzel394/zsh-copilot) by [Myzel394](https://github.com/Myzel394).
 
 Get AI-powered command suggestions **directly** in your zsh shell. No complex setup, no external tools - just press `CTRL + O` and get intelligent command suggestions powered by OpenAI, Anthropic Claude, or Google Gemini.
+
+> [!NOTE]
+> 
+> This project is still in its early stages, and some features may be immature and unstable. I appreciate your understanding.
 
 
 https://github.com/user-attachments/assets/90eaf300-c891-4ef9-958d-9890f53f9929
@@ -10,7 +16,7 @@ https://github.com/user-attachments/assets/90eaf300-c891-4ef9-958d-9890f53f9929
 
 ## Features
 
-- **🚀 Intelligent Prediction**: Predicts the next command you are likely to input based on context (history, aliases, terminal buffer)
+- **🚀 Context-aware intelligent prediction**: Predicts the next command you are likely to input based on context (history, aliases, terminal buffer)
 - **🤖 Multiple AI Providers**: Support for OpenAI GPT, Anthropic Claude, and Google Gemini
 - **🔧 Highly Configurable**: Customize keybindings, AI provider, context sharing, and more
 
