@@ -79,20 +79,20 @@ func (lr *LogRotator) CheckAndRotate(logFilePath string) error {
 func (lr *LogRotator) rotateFile(logFilePath string) error {
 	// Generate timestamp for the backup file
 	timestamp := time.Now().Format("20060102-150405")
-	
+
 	// Create backup filename
 	dir := filepath.Dir(logFilePath)
 	base := filepath.Base(logFilePath)
 	ext := filepath.Ext(base)
 	name := strings.TrimSuffix(base, ext)
-	
+
 	backupPath := filepath.Join(dir, fmt.Sprintf("%s-%s%s", name, timestamp, ext))
-	
+
 	// Move current log file to backup
 	if err := os.Rename(logFilePath, backupPath); err != nil {
 		return fmt.Errorf("failed to rename log file %s to %s: %w", logFilePath, backupPath, err)
 	}
-	
+
 	// Compress the backup file if enabled
 	if lr.config.Compress {
 		compressedPath := backupPath + ".gz"
@@ -105,13 +105,13 @@ func (lr *LogRotator) rotateFile(logFilePath string) error {
 			backupPath = compressedPath
 		}
 	}
-	
+
 	// Clean up old backup files
 	if err := lr.cleanupOldBackups(logFilePath); err != nil {
 		// Log the error but don't fail the rotation
 		fmt.Fprintf(os.Stderr, "Warning: failed to cleanup old backups for %s: %v\n", logFilePath, err)
 	}
-	
+
 	return nil
 }
 
@@ -122,20 +122,20 @@ func (lr *LogRotator) compressFile(srcPath, dstPath string) error {
 		return fmt.Errorf("failed to open source file %s: %w", srcPath, err)
 	}
 	defer srcFile.Close()
-	
+
 	dstFile, err := os.Create(dstPath)
 	if err != nil {
 		return fmt.Errorf("failed to create destination file %s: %w", dstPath, err)
 	}
 	defer dstFile.Close()
-	
+
 	gzipWriter := gzip.NewWriter(dstFile)
 	defer gzipWriter.Close()
-	
+
 	if _, err := io.Copy(gzipWriter, srcFile); err != nil {
 		return fmt.Errorf("failed to compress file: %w", err)
 	}
-	
+
 	return nil
 }
 
@@ -145,58 +145,58 @@ func (lr *LogRotator) cleanupOldBackups(logFilePath string) error {
 	base := filepath.Base(logFilePath)
 	ext := filepath.Ext(base)
 	name := strings.TrimSuffix(base, ext)
-	
+
 	// Find all backup files
 	pattern := filepath.Join(dir, fmt.Sprintf("%s-*%s*", name, ext))
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
 		return fmt.Errorf("failed to find backup files with pattern %s: %w", pattern, err)
 	}
-	
+
 	// Create a list of backup files with their info
 	type backupFile struct {
 		path    string
 		modTime time.Time
 	}
-	
+
 	var backups []backupFile
 	cutoffTime := time.Now().AddDate(0, 0, -lr.config.MaxAge)
-	
+
 	for _, match := range matches {
 		// Skip the current log file
 		if match == logFilePath {
 			continue
 		}
-		
+
 		fileInfo, err := os.Stat(match)
 		if err != nil {
 			continue
 		}
-		
+
 		// Remove files older than MaxAge
 		if fileInfo.ModTime().Before(cutoffTime) {
 			os.Remove(match)
 			continue
 		}
-		
+
 		backups = append(backups, backupFile{
 			path:    match,
 			modTime: fileInfo.ModTime(),
 		})
 	}
-	
+
 	// Sort by modification time (newest first)
 	sort.Slice(backups, func(i, j int) bool {
 		return backups[i].modTime.After(backups[j].modTime)
 	})
-	
+
 	// Remove excess backup files
 	if len(backups) > lr.config.MaxBackups {
 		for i := lr.config.MaxBackups; i < len(backups); i++ {
 			os.Remove(backups[i].path)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -204,7 +204,7 @@ func (lr *LogRotator) cleanupOldBackups(logFilePath string) error {
 func (lr *LogRotator) ForceRotate(logFilePath string) error {
 	lr.mutex.Lock()
 	defer lr.mutex.Unlock()
-	
+
 	// Check if file exists
 	if _, err := os.Stat(logFilePath); err != nil {
 		if os.IsNotExist(err) {
@@ -212,7 +212,7 @@ func (lr *LogRotator) ForceRotate(logFilePath string) error {
 		}
 		return fmt.Errorf("failed to stat log file %s: %w", logFilePath, err)
 	}
-	
+
 	return lr.rotateFile(logFilePath)
 }
 
@@ -222,14 +222,14 @@ func (lr *LogRotator) GetBackupFiles(logFilePath string) ([]string, error) {
 	base := filepath.Base(logFilePath)
 	ext := filepath.Ext(base)
 	name := strings.TrimSuffix(base, ext)
-	
+
 	// Find all backup files
 	pattern := filepath.Join(dir, fmt.Sprintf("%s-*%s*", name, ext))
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find backup files with pattern %s: %w", pattern, err)
 	}
-	
+
 	// Filter out the current log file
 	var backups []string
 	for _, match := range matches {
@@ -237,17 +237,17 @@ func (lr *LogRotator) GetBackupFiles(logFilePath string) ([]string, error) {
 			backups = append(backups, match)
 		}
 	}
-	
+
 	return backups, nil
 }
 
 // ParseSizeString parses size strings like "10MB", "1GB", "500KB"
 func ParseSizeString(sizeStr string) (int64, error) {
 	sizeStr = strings.ToUpper(strings.TrimSpace(sizeStr))
-	
+
 	var multiplier int64 = 1
 	var numStr string
-	
+
 	if strings.HasSuffix(sizeStr, "KB") {
 		multiplier = 1024
 		numStr = strings.TrimSuffix(sizeStr, "KB")
@@ -264,12 +264,11 @@ func ParseSizeString(sizeStr string) (int64, error) {
 		// Assume bytes if no suffix
 		numStr = sizeStr
 	}
-	
+
 	num, err := strconv.ParseInt(numStr, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid size format: %s", sizeStr)
 	}
-	
+
 	return num * multiplier, nil
 }
-

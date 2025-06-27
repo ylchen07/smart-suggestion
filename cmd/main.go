@@ -51,6 +51,12 @@ type OpenAIError struct {
 	Type    string `json:"type"`
 }
 
+// Azure OpenAI uses the same structures as OpenAI but different API endpoints and authentication
+// Azure OpenAI API structures (reuse OpenAI structures)
+type AzureOpenAIRequest = OpenAIRequest
+type AzureOpenAIResponse = OpenAIResponse
+type AzureOpenAIError = OpenAIError
+
 // Anthropic API structures
 type AnthropicMessage struct {
 	Role    string `json:"role"`
@@ -163,16 +169,16 @@ Examples:
       Your response: '=kubectl describe node node-bbb' (kubectl is the command for interacting with kubernetes)`
 
 var (
-	provider      string
-	input         string
-	systemPrompt  string
-	debug         bool
-	outputFile    string
-	sendContext   bool
-	proxyMode     bool
-	proxyLogFile  string
-	sessionID     string
-	
+	provider     string
+	input        string
+	systemPrompt string
+	debug        bool
+	outputFile   string
+	sendContext  bool
+	proxyMode    bool
+	proxyLogFile string
+	sessionID    string
+
 	// Global log rotator instance
 	logRotator *pkg.LogRotator
 )
@@ -185,7 +191,7 @@ func init() {
 	config.MaxBackups = 3
 	config.Compress = true
 	config.MaxAge = 7 // 7 days
-	
+
 	logRotator = pkg.NewLogRotator(config)
 }
 
@@ -210,9 +216,8 @@ func main() {
 		Run:   runRotateLogs,
 	}
 
-
 	// Root command flags
-	rootCmd.Flags().StringVarP(&provider, "provider", "p", "", "AI provider (openai, anthropic, or gemini)")
+	rootCmd.Flags().StringVarP(&provider, "provider", "p", "", "AI provider (openai, azure_openai, anthropic, or gemini)")
 	rootCmd.Flags().StringVarP(&input, "input", "i", "", "User input")
 	rootCmd.Flags().StringVarP(&systemPrompt, "system", "s", "", "System prompt (optional, uses default if not provided)")
 	rootCmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
@@ -252,7 +257,7 @@ func runFetch(cmd *cobra.Command, args []string) {
 	if systemPrompt == "" {
 		systemPrompt = defaultSystemPrompt
 	}
-	
+
 	// Build the complete prompt with context if requested
 	completePrompt := systemPrompt
 	if sendContext {
@@ -278,6 +283,8 @@ func runFetch(cmd *cobra.Command, args []string) {
 	switch strings.ToLower(provider) {
 	case "openai":
 		suggestion, err = fetchOpenAI()
+	case "azure_openai":
+		suggestion, err = fetchAzureOpenAI()
 	case "anthropic":
 		suggestion, err = fetchAnthropic()
 	case "gemini":
@@ -294,7 +301,7 @@ func runFetch(cmd *cobra.Command, args []string) {
 				"input":    input,
 			})
 		}
-		
+
 		errorMsg := fmt.Sprintf("Error fetching suggestions from %s API: %v", provider, err)
 		if err := os.WriteFile("/tmp/.smart_suggestion_error", []byte(errorMsg), 0644); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to write error file: %v\n", err)
@@ -396,6 +403,103 @@ func fetchOpenAI() (string, error) {
 	return response.Choices[0].Message.Content, nil
 }
 
+func fetchAzureOpenAI() (string, error) {
+	apiKey := os.Getenv("AZURE_OPENAI_API_KEY")
+	if apiKey == "" {
+		return "", fmt.Errorf("AZURE_OPENAI_API_KEY environment variable is not set")
+	}
+
+	// Azure OpenAI requires resource name and deployment name
+	resourceName := os.Getenv("AZURE_OPENAI_RESOURCE_NAME")
+	if resourceName == "" {
+		return "", fmt.Errorf("AZURE_OPENAI_RESOURCE_NAME environment variable is not set")
+	}
+
+	deploymentName := os.Getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+	if deploymentName == "" {
+		return "", fmt.Errorf("AZURE_OPENAI_DEPLOYMENT_NAME environment variable is not set")
+	}
+
+	// API version for Azure OpenAI
+	apiVersion := os.Getenv("AZURE_OPENAI_API_VERSION")
+	if apiVersion == "" {
+		apiVersion = "2024-10-21" // Default to latest stable version
+	}
+
+	// Azure OpenAI endpoint format
+	url := fmt.Sprintf("https://%s.openai.azure.com/openai/deployments/%s/chat/completions?api-version=%s",
+		resourceName, deploymentName, apiVersion)
+
+	request := AzureOpenAIRequest{
+		Model: deploymentName, // In Azure OpenAI, this should match the deployment name
+		Messages: []OpenAIMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: input},
+		},
+	}
+
+	jsonData, err := json.Marshal(request)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	if debug {
+		logDebug("Sending Azure OpenAI request", map[string]any{
+			"url":           url,
+			"resource_name": resourceName,
+			"deployment":    deploymentName,
+			"api_version":   apiVersion,
+			"request":       string(jsonData),
+		})
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("api-key", apiKey) // Azure OpenAI uses "api-key" header
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if debug {
+		logDebug("Received Azure OpenAI response", map[string]any{
+			"status":   resp.Status,
+			"response": string(body),
+		})
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var response AzureOpenAIResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return "", fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	if response.Error != nil {
+		return "", fmt.Errorf("Azure OpenAI API error: %s", response.Error.Message)
+	}
+
+	if len(response.Choices) == 0 {
+		return "", fmt.Errorf("no choices returned from Azure OpenAI API")
+	}
+
+	return response.Choices[0].Message.Content, nil
+}
+
 func fetchAnthropic() (string, error) {
 	apiKey := os.Getenv("ANTHROPIC_API_KEY")
 	if apiKey == "" {
@@ -489,7 +593,7 @@ func writeToLogFile(logFilePath, content string) error {
 		log.Printf("Failed to rotate log file: %v", err)
 		// Continue with logging even if rotation fails
 	}
-	
+
 	file, err := os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to open log file: %w", err)
@@ -502,12 +606,12 @@ func writeToLogFile(logFilePath, content string) error {
 
 func logDebug(message string, data map[string]any) {
 	logFilePath := "/tmp/smart-suggestion.log"
-	
+
 	logEntry := map[string]any{
-		"date":    time.Now().Format(time.RFC3339),
-		"log":     message,
+		"date": time.Now().Format(time.RFC3339),
+		"log":  message,
 	}
-	
+
 	for k, v := range data {
 		logEntry[k] = v
 	}
@@ -526,31 +630,31 @@ func logDebug(message string, data map[string]any) {
 // buildContextInfo builds context information similar to the zsh plugin
 func buildContextInfo() (string, error) {
 	var contextParts []string
-	
+
 	// Get user information
 	currentUser := os.Getenv("USER")
 	if currentUser == "" {
 		currentUser = "unknown"
 	}
-	
+
 	// Get current directory
 	currentDir, err := os.Getwd()
 	if err != nil {
 		currentDir = "unknown"
 	}
-	
+
 	// Get shell information
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		shell = "unknown"
 	}
-	
+
 	// Get terminal information
 	term := os.Getenv("TERM")
 	if term == "" {
 		term = "unknown"
 	}
-	
+
 	// Get system information
 	systemInfo, err := getSystemInfo()
 	if err != nil {
@@ -561,7 +665,7 @@ func buildContextInfo() (string, error) {
 		}
 		systemInfo = "unknown system"
 	}
-	
+
 	// Get user ID information
 	userID, err := getUserID()
 	if err != nil {
@@ -572,7 +676,7 @@ func buildContextInfo() (string, error) {
 		}
 		userID = "unknown"
 	}
-	
+
 	// Get uname information
 	unameInfo, err := getUnameInfo()
 	if err != nil {
@@ -583,12 +687,12 @@ func buildContextInfo() (string, error) {
 		}
 		unameInfo = "unknown"
 	}
-	
+
 	// Build the basic context
 	basicContext := fmt.Sprintf("# Context:\nYou are user %s with id %s in directory %s. Your shell is %s and your terminal is %s running on %s. %s",
 		currentUser, userID, currentDir, shell, term, unameInfo, systemInfo)
 	contextParts = append(contextParts, basicContext)
-	
+
 	// Get aliases
 	aliases, err := getAliases()
 	if err != nil {
@@ -611,7 +715,7 @@ func buildContextInfo() (string, error) {
 	} else {
 		contextParts = append(contextParts, "\n# Shell history:\n", shellHistory)
 	}
-	
+
 	// Get tmux buffer content if available
 	shellBuffer, err := getShellBuffer()
 	if err != nil {
@@ -623,7 +727,7 @@ func buildContextInfo() (string, error) {
 	} else {
 		contextParts = append(contextParts, "\n# Shell buffer:\n", shellBuffer)
 	}
-	
+
 	return strings.Join(contextParts, ""), nil
 }
 
@@ -637,7 +741,7 @@ func getSystemInfo() (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("failed to run sw_vers: %w", err)
 		}
-		
+
 		// Process output similar to: $(sw_vers | xargs | sed 's/ /./g')
 		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 		var parts []string
@@ -645,23 +749,23 @@ func getSystemInfo() (string, error) {
 			parts = append(parts, strings.ReplaceAll(line, " ", "."))
 		}
 		return fmt.Sprintf("Your system is %s.", strings.Join(parts, ".")), nil
-		
+
 	default:
 		// Linux and others: read /etc/*-release files
 		releaseFiles := []string{"/etc/os-release", "/etc/lsb-release", "/etc/redhat-release"}
 		var content []string
-		
+
 		for _, file := range releaseFiles {
 			data, err := os.ReadFile(file)
 			if err == nil {
 				content = append(content, string(data))
 			}
 		}
-		
+
 		if len(content) == 0 {
 			return "", fmt.Errorf("no release files found")
 		}
-		
+
 		// Process similar to: $(cat /etc/*-release | xargs | sed 's/ /,/g')
 		allContent := strings.Join(content, " ")
 		processedContent := strings.ReplaceAll(strings.TrimSpace(allContent), " ", ",")
@@ -699,7 +803,7 @@ func fetchGemini() (string, error) {
 
 	// Gemini API expects a different format - system prompt and user input are combined
 	var contents []GeminiContent
-	
+
 	// Add system prompt as user message (Gemini doesn't have separate system role)
 	if systemPrompt != "" {
 		contents = append(contents, GeminiContent{
@@ -711,7 +815,7 @@ func fetchGemini() (string, error) {
 			Role:  "model",
 		})
 	}
-	
+
 	// Add user input
 	contents = append(contents, GeminiContent{
 		Parts: []GeminiPart{{Text: input}},
@@ -802,7 +906,7 @@ func getAliases() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to get aliases: %w", err)
 	}
-	
+
 	// No need to escape quotes here as Go handles JSON encoding properly
 	return strings.TrimSpace(string(output)), nil
 }
@@ -829,7 +933,7 @@ func createProcessLock(lockPath string) (*os.File, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create lock directory: %w", err)
 	}
-	
+
 	// Try to create and lock the file
 	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0644)
 	if err != nil {
@@ -849,14 +953,14 @@ func createProcessLock(lockPath string) (*os.File, error) {
 			return nil, fmt.Errorf("failed to create lock file: %w", err)
 		}
 	}
-	
+
 	// Try to acquire an exclusive lock
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		file.Close()
 		os.Remove(lockPath)
 		return nil, fmt.Errorf("failed to acquire lock: %w", err)
 	}
-	
+
 	// Write PID to the lock file
 	pid := os.Getpid()
 	if _, err := file.WriteString(fmt.Sprintf("%d\n", pid)); err != nil {
@@ -864,13 +968,13 @@ func createProcessLock(lockPath string) (*os.File, error) {
 		os.Remove(lockPath)
 		return nil, fmt.Errorf("failed to write PID to lock file: %w", err)
 	}
-	
+
 	if err := file.Sync(); err != nil {
 		file.Close()
 		os.Remove(lockPath)
 		return nil, fmt.Errorf("failed to sync lock file: %w", err)
 	}
-	
+
 	return file, nil
 }
 
@@ -880,19 +984,19 @@ func isProcessRunning(lockPath string) bool {
 	if err != nil {
 		return false
 	}
-	
+
 	pidStr := strings.TrimSpace(string(data))
 	pid, err := strconv.Atoi(pidStr)
 	if err != nil {
 		return false
 	}
-	
+
 	// Check if process is running by sending signal 0
 	process, err := os.FindProcess(pid)
 	if err != nil {
 		return false
 	}
-	
+
 	err = process.Signal(syscall.Signal(0))
 	return err == nil
 }
@@ -913,12 +1017,12 @@ func generateSessionID() (string, error) {
 	if _, err := rand.Read(randomBytes); err != nil {
 		return "", fmt.Errorf("failed to generate random bytes: %w", err)
 	}
-	
+
 	// Create session ID with PID and timestamp for uniqueness
 	pid := os.Getpid()
 	timestamp := time.Now().Unix()
 	randomHex := hex.EncodeToString(randomBytes)
-	
+
 	sessionID := fmt.Sprintf("%d_%d_%s", pid, timestamp, randomHex)
 	return sessionID, nil
 }
@@ -928,17 +1032,17 @@ func getSessionBasedLogFile(baseLogFile, sessionID string) string {
 	if sessionID == "" {
 		return baseLogFile
 	}
-	
+
 	// Extract directory and base filename
 	dir := filepath.Dir(baseLogFile)
 	base := filepath.Base(baseLogFile)
-	
+
 	// Remove extension if present
 	ext := filepath.Ext(base)
 	if ext != "" {
 		base = strings.TrimSuffix(base, ext)
 	}
-	
+
 	// Create session-specific filename
 	sessionLogFile := fmt.Sprintf("%s.%s%s", base, sessionID, ext)
 	return filepath.Join(dir, sessionLogFile)
@@ -949,14 +1053,14 @@ func getSessionBasedLockFile(baseLockFile, sessionID string) string {
 	if sessionID == "" {
 		return baseLockFile
 	}
-	
+
 	dir := filepath.Dir(baseLockFile)
 	base := filepath.Base(baseLockFile)
 	ext := filepath.Ext(base)
 	if ext != "" {
 		base = strings.TrimSuffix(base, ext)
 	}
-	
+
 	sessionLockFile := fmt.Sprintf("%s.%s%s", base, sessionID, ext)
 	return filepath.Join(dir, sessionLockFile)
 }
@@ -967,12 +1071,12 @@ func getCurrentSessionID() string {
 	if sessionID := os.Getenv("SMART_SUGGESTION_SESSION_ID"); sessionID != "" {
 		return sessionID
 	}
-	
+
 	// Try to get from TTY device name
 	if ttyName := getTTYName(); ttyName != "" {
 		return ttyName
 	}
-	
+
 	// Generate a new one based on PID
 	return fmt.Sprintf("pid_%d", os.Getpid())
 }
@@ -986,7 +1090,7 @@ func getTTYName() string {
 			return strings.ReplaceAll(parts[len(parts)-1], ".", "_")
 		}
 	}
-	
+
 	// Try to get from tty command
 	cmd := exec.Command("tty")
 	output, err := cmd.Output()
@@ -1000,7 +1104,7 @@ func getTTYName() string {
 			return deviceName
 		}
 	}
-	
+
 	return ""
 }
 
@@ -1008,46 +1112,46 @@ func getTTYName() string {
 func cleanupOldSessionLogs(baseLogPath string, maxAge time.Duration) error {
 	dir := filepath.Dir(baseLogPath)
 	base := filepath.Base(baseLogPath)
-	
+
 	// Remove extension for pattern matching
 	ext := filepath.Ext(base)
 	if ext != "" {
 		base = strings.TrimSuffix(base, ext)
 	}
-	
+
 	// Pattern to match session log files
 	pattern := fmt.Sprintf("%s.*%s", base, ext)
-	
+
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("failed to read directory %s: %w", dir, err)
 	}
-	
+
 	cutoff := time.Now().Add(-maxAge)
 	var removedFiles []string
-	
+
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
-		
+
 		filename := entry.Name()
 		// Check if this looks like a session log file
 		if matched, _ := filepath.Match(pattern, filename); !matched {
 			continue
 		}
-		
+
 		// Skip the base file itself
 		if filename == filepath.Base(baseLogPath) {
 			continue
 		}
-		
+
 		fullPath := filepath.Join(dir, filename)
 		info, err := os.Stat(fullPath)
 		if err != nil {
 			continue
 		}
-		
+
 		// Remove if older than cutoff
 		if info.ModTime().Before(cutoff) {
 			if err := os.Remove(fullPath); err == nil {
@@ -1055,14 +1159,14 @@ func cleanupOldSessionLogs(baseLogPath string, maxAge time.Duration) error {
 			}
 		}
 	}
-	
+
 	if len(removedFiles) > 0 && debug {
 		logDebug("Cleaned up old session logs", map[string]any{
 			"removed_files": removedFiles,
 			"base_path":     baseLogPath,
 		})
 	}
-	
+
 	return nil
 }
 
@@ -1097,7 +1201,7 @@ func runProxy(cmd *cobra.Command, args []string) {
 	// Create session-based file paths
 	sessionLogFile := getSessionBasedLogFile(proxyLogFile, sessionID)
 	sessionLockFile := getSessionBasedLockFile("/tmp/smart-suggestion-proxy.lock", sessionID)
-	
+
 	// Create a lock file to prevent duplicate proxy processes for this session
 	lockFile, err := createProcessLock(sessionLockFile)
 	if err != nil {
@@ -1111,15 +1215,15 @@ func runProxy(cmd *cobra.Command, args []string) {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	
+
 	// Ensure cleanup on exit
 	defer cleanupProcessLock(lockFile, sessionLockFile)
-	
+
 	// Set environment variables for child processes
 	os.Setenv("SMART_SUGGESTION_SESSION_ID", sessionID)
 	// Set proxy active flag with current PID to prevent nesting
 	os.Setenv("SMART_SUGGESTION_PROXY_ACTIVE", fmt.Sprintf("%d", os.Getpid()))
-	
+
 	// Clean up old session logs (older than 24 hours)
 	if err := cleanupOldSessionLogs(proxyLogFile, 24*time.Hour); err != nil {
 		if debug {
@@ -1129,25 +1233,25 @@ func runProxy(cmd *cobra.Command, args []string) {
 		}
 		// Continue even if cleanup fails
 	}
-	
+
 	if debug {
 		logDebug("Starting shell proxy mode with PTY", map[string]any{
-			"log_file":        sessionLogFile,
-			"lock_file":       sessionLockFile,
-			"session_id":      sessionID,
-			"pid":             os.Getpid(),
+			"log_file":   sessionLogFile,
+			"lock_file":  sessionLockFile,
+			"session_id": sessionID,
+			"pid":        os.Getpid(),
 		})
 	}
-	
+
 	// Get the user's shell, default to bash if not set
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		shell = "/bin/bash"
 	}
-	
+
 	// Create a shell command
 	c := exec.Command(shell)
-	
+
 	// Start the shell with a pty
 	ptmx, err := pty.Start(c)
 	if err != nil {
@@ -1161,7 +1265,7 @@ func runProxy(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 	defer func() { _ = ptmx.Close() }()
-	
+
 	// Handle pty size changes
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGWINCH)
@@ -1178,7 +1282,7 @@ func runProxy(cmd *cobra.Command, args []string) {
 	}()
 	ch <- syscall.SIGWINCH // Initial resize
 	defer func() { signal.Stop(ch); close(ch) }()
-	
+
 	// Set stdin in raw mode to properly handle terminal input (only if it's a terminal)
 	var oldState *term.State
 	if term.IsTerminal(int(os.Stdin.Fd())) {
@@ -1192,9 +1296,9 @@ func runProxy(cmd *cobra.Command, args []string) {
 			fmt.Fprintf(os.Stderr, "Failed to set raw mode: %v\n", err)
 			os.Exit(1)
 		}
-		defer func() { 
+		defer func() {
 			if oldState != nil {
-				_ = term.Restore(int(os.Stdin.Fd()), oldState) 
+				_ = term.Restore(int(os.Stdin.Fd()), oldState)
 			}
 		}()
 	} else {
@@ -1219,7 +1323,7 @@ func runProxy(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 	}
-	
+
 	// Open session log file for writing
 	logFile, err := os.OpenFile(sessionLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
@@ -1234,17 +1338,17 @@ func runProxy(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 	defer logFile.Close()
-	
+
 	// Create a tee writer to write to both stdout and log file
 	teeWriter := io.MultiWriter(os.Stdout, logFile)
-	
+
 	// Handle graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	
+
 	// Start goroutines for copying data
 	done := make(chan struct{})
-	
+
 	// Copy from stdin to pty (user input)
 	go func() {
 		defer close(done)
@@ -1255,7 +1359,7 @@ func runProxy(cmd *cobra.Command, args []string) {
 			})
 		}
 	}()
-	
+
 	// Copy from pty to stdout and log file (shell output)
 	go func() {
 		_, err := io.Copy(teeWriter, ptmx)
@@ -1266,7 +1370,7 @@ func runProxy(cmd *cobra.Command, args []string) {
 		}
 		done <- struct{}{}
 	}()
-	
+
 	// Wait for either completion or signal
 	select {
 	case <-done:
@@ -1300,7 +1404,7 @@ func getShellBuffer() (string, error) {
 			})
 		}
 	}
-	
+
 	// Try to read from session-specific proxy log file if it exists
 	currentSessionID := getCurrentSessionID()
 	if currentSessionID != "" && proxyLogFile != "" {
@@ -1317,7 +1421,7 @@ func getShellBuffer() (string, error) {
 			})
 		}
 	}
-	
+
 	// Fallback to base proxy log file if session-specific file doesn't exist
 	if proxyLogFile != "" {
 		content, err := readLatestProxyContent(proxyLogFile)
@@ -1331,19 +1435,19 @@ func getShellBuffer() (string, error) {
 			})
 		}
 	}
-	
+
 	// Try screen if available
 	content, err := getScreenBuffer()
 	if err == nil {
 		return content, nil
 	}
-	
+
 	// Try to get terminal buffer using tput if available
 	content, err = getTerminalBufferWithTput()
 	if err == nil {
 		return content, nil
 	}
-	
+
 	return "", fmt.Errorf("no terminal buffer available - not in tmux/screen session and no proxy log found")
 }
 
@@ -1354,12 +1458,12 @@ func readLatestProxyContent(logFile string) (string, error) {
 		return "", fmt.Errorf("failed to open proxy log file: %w", err)
 	}
 	defer file.Close()
-	
+
 	// Read the last N lines from the file
 	const maxLines = 50
 	scanner := bufio.NewScanner(file)
 	var lines []string
-	
+
 	for scanner.Scan() {
 		lines = append(lines, scanner.Text())
 		// Keep only the last maxLines
@@ -1367,11 +1471,11 @@ func readLatestProxyContent(logFile string) (string, error) {
 			lines = lines[1:]
 		}
 	}
-	
+
 	if err := scanner.Err(); err != nil {
 		return "", fmt.Errorf("failed to read proxy log file: %w", err)
 	}
-	
+
 	return strings.Join(lines, "\n"), nil
 }
 
@@ -1381,22 +1485,22 @@ func getScreenBuffer() (string, error) {
 	if os.Getenv("STY") == "" {
 		return "", fmt.Errorf("not in a screen session")
 	}
-	
+
 	// Try to capture screen buffer
 	cmd := exec.Command("screen", "-X", "hardcopy", "/tmp/screen_buffer.txt")
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("failed to capture screen buffer: %w", err)
 	}
-	
+
 	// Read the captured buffer
 	content, err := os.ReadFile("/tmp/screen_buffer.txt")
 	if err != nil {
 		return "", fmt.Errorf("failed to read screen buffer: %w", err)
 	}
-	
+
 	// Clean up the temporary file
 	os.Remove("/tmp/screen_buffer.txt")
-	
+
 	return strings.TrimSpace(string(content)), nil
 }
 
@@ -1409,16 +1513,16 @@ func getTerminalBufferWithTput() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to get terminal rows: %w", err)
 	}
-	
+
 	rows, err := strconv.Atoi(strings.TrimSpace(string(rowsOutput)))
 	if err != nil {
 		return "", fmt.Errorf("failed to parse terminal rows: %w", err)
 	}
-	
+
 	// This is a very limited approach and may not work in all terminals
 	// We can try to use ANSI escape sequences to query the terminal
 	// but this is complex and terminal-dependent
-	
+
 	// For now, return an error indicating this method is not implemented
 	return "", fmt.Errorf("tput method not fully implemented (terminal has %d rows)", rows)
 }
@@ -1429,13 +1533,13 @@ func runRotateLogs(cmd *cobra.Command, args []string) {
 		fmt.Fprintf(os.Stderr, "Error: log file path is required\n")
 		os.Exit(1)
 	}
-	
+
 	if debug {
 		logDebug("Starting log rotation", map[string]any{
 			"log_file": proxyLogFile,
 		})
 	}
-	
+
 	// Check if the log file exists
 	if _, err := os.Stat(proxyLogFile); os.IsNotExist(err) {
 		if debug {
@@ -1446,7 +1550,7 @@ func runRotateLogs(cmd *cobra.Command, args []string) {
 		fmt.Printf("Log file %s does not exist, nothing to rotate\n", proxyLogFile)
 		return
 	}
-	
+
 	// Perform log rotation
 	if err := logRotator.ForceRotate(proxyLogFile); err != nil {
 		if debug {
@@ -1458,13 +1562,13 @@ func runRotateLogs(cmd *cobra.Command, args []string) {
 		fmt.Fprintf(os.Stderr, "Error rotating log file %s: %v\n", proxyLogFile, err)
 		os.Exit(1)
 	}
-	
+
 	if debug {
 		logDebug("Log rotation completed successfully", map[string]any{
 			"log_file": proxyLogFile,
 		})
 	}
-	
+
 	// Get backup files to show what was created
 	backups, err := logRotator.GetBackupFiles(proxyLogFile)
 	if err != nil {
@@ -1473,5 +1577,3 @@ func runRotateLogs(cmd *cobra.Command, args []string) {
 		fmt.Printf("Log file %s rotated successfully. Backup files: %v\n", proxyLogFile, backups)
 	}
 }
-
-
