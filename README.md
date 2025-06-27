@@ -4,6 +4,10 @@
 
 Get AI-powered command suggestions **directly** in your zsh shell. No complex setup, no external tools - just press `CTRL + O` and get intelligent command suggestions powered by OpenAI, Anthropic Claude, or Google Gemini.
 
+
+https://github.com/user-attachments/assets/90eaf300-c891-4ef9-958d-9890f53f9929
+
+
 ## Features
 
 - **🚀 Intelligent Prediction**: Predicts the next command you are likely to input based on context (history, aliases, terminal buffer)
