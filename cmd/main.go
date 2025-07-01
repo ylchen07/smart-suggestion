@@ -57,6 +57,23 @@ type AzureOpenAIRequest = OpenAIRequest
 type AzureOpenAIResponse = OpenAIResponse
 type AzureOpenAIError = OpenAIError
 
+// DeepSeek API is OpenAI-compatible, reuse the same structures
+type DeepSeekRequest = OpenAIRequest
+type DeepSeekResponse = OpenAIResponse
+type DeepSeekError = OpenAIError
+
+// parseAndExtractCommand parses the raw response from the AI model,
+// separating the reasoning from the command.
+func parseAndExtractCommand(response string) string {
+	closingTag := "</reasoning>"
+	if pos := strings.LastIndex(response, closingTag); pos != -1 {
+		commandPart := response[pos+len(closingTag):]
+		return strings.TrimSpace(commandPart)
+	}
+	// Fallback for responses without reasoning tags
+	return strings.TrimSpace(response)
+}
+
 // Anthropic API structures
 type AnthropicMessage struct {
 	Role    string `json:"role"`
@@ -112,18 +129,6 @@ type GeminiResponse struct {
 type GeminiError struct {
 	Message string `json:"message"`
 	Code    int    `json:"code"`
-}
-
-// parseAndExtractCommand parses the raw response from the AI model,
-// separating the reasoning from the command.
-func parseAndExtractCommand(response string) string {
-	closingTag := "</reasoning>"
-	if pos := strings.LastIndex(response, closingTag); pos != -1 {
-		commandPart := response[pos+len(closingTag):]
-		return strings.TrimSpace(commandPart)
-	}
-	// Fallback for responses without reasoning tags
-	return strings.TrimSpace(response)
 }
 
 // Default system prompt
@@ -287,7 +292,7 @@ func main() {
 	}
 
 	// Root command flags
-	rootCmd.Flags().StringVarP(&provider, "provider", "p", "", "AI provider (openai, azure_openai, anthropic, or gemini)")
+	rootCmd.Flags().StringVarP(&provider, "provider", "p", "", "AI provider (openai, azure_openai, anthropic, gemini, or deepseek)")
 	rootCmd.Flags().StringVarP(&input, "input", "i", "", "User input")
 	rootCmd.Flags().StringVarP(&systemPrompt, "system", "s", "", "System prompt (optional, uses default if not provided)")
 	rootCmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
@@ -359,6 +364,8 @@ func runFetch(cmd *cobra.Command, args []string) {
 		suggestion, err = fetchAnthropic()
 	case "gemini":
 		suggestion, err = fetchGemini()
+	case "deepseek":
+		suggestion, err = fetchDeepSeek()
 	default:
 		err = fmt.Errorf("unsupported provider: %s", provider)
 	}
@@ -384,9 +391,9 @@ func runFetch(cmd *cobra.Command, args []string) {
 
 	if debug {
 		logDebug("Successfully fetched suggestion", map[string]any{
-			"provider":           provider,
-			"input":              input,
-			"original_response":  suggestion,
+			"provider":          provider,
+			"input":             input,
+			"original_response": suggestion,
 			"parsed_suggestion": finalSuggestion,
 		})
 	}
@@ -1698,4 +1705,99 @@ func runRotateLogs(cmd *cobra.Command, args []string) {
 	} else {
 		fmt.Printf("Log file %s rotated successfully. Backup files: %v\n", proxyLogFile, backups)
 	}
+}
+
+func fetchDeepSeek() (string, error) {
+	apiKey := os.Getenv("DEEPSEEK_API_KEY")
+	if apiKey == "" {
+		return "", fmt.Errorf("DEEPSEEK_API_KEY environment variable is not set")
+	}
+
+	baseURL := os.Getenv("DEEPSEEK_BASE_URL")
+	if baseURL == "" {
+		baseURL = "https://api.deepseek.com"
+	}
+
+	// Handle different base URL formats
+	var url string
+	if strings.HasPrefix(baseURL, "http://") || strings.HasPrefix(baseURL, "https://") {
+		// Base URL already includes protocol
+		baseURL = strings.TrimSuffix(baseURL, "/")
+		url = fmt.Sprintf("%s/chat/completions", baseURL)
+	} else {
+		// Base URL is just hostname, add https protocol
+		url = fmt.Sprintf("https://%s/chat/completions", baseURL)
+	}
+
+	// Get model from environment or use default
+	model := os.Getenv("DEEPSEEK_MODEL")
+	if model == "" {
+		model = "deepseek-chat" // Default to deepseek-chat which points to DeepSeek-V3-0324
+	}
+
+	request := DeepSeekRequest{
+		Model: model,
+		Messages: []OpenAIMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: input},
+		},
+	}
+
+	jsonData, err := json.Marshal(request)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	if debug {
+		logDebug("Sending DeepSeek request", map[string]any{
+			"url":     url,
+			"request": string(jsonData),
+		})
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if debug {
+		logDebug("Received DeepSeek response", map[string]any{
+			"status":   resp.Status,
+			"response": string(body),
+		})
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var response DeepSeekResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return "", fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	if response.Error != nil {
+		return "", fmt.Errorf("DeepSeek API error: %s", response.Error.Message)
+	}
+
+	if len(response.Choices) == 0 {
+		return "", fmt.Errorf("no choices returned from DeepSeek API")
+	}
+
+	return response.Choices[0].Message.Content, nil
 }
