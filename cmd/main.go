@@ -1,8 +1,10 @@
 package main
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -131,6 +133,14 @@ type GeminiError struct {
 	Code    int    `json:"code"`
 }
 
+type GitHubRelease struct {
+	TagName string `json:"tag_name"`
+	Assets  []struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+	} `json:"assets"`
+}
+
 // Default system prompt
 const defaultSystemPrompt = `You are a professional SRE engineer with decades of experience, proficient in all shell commands.
 
@@ -244,6 +254,15 @@ Examples:
 =kubectl describe node node-bbb`
 
 var (
+	// These will be set during build time using ldflags
+	Version   = "dev"
+	BuildTime = "unknown"
+	GitCommit = "unknown"
+	OS        = "unknown"
+	Arch      = "unknown"
+)
+
+var (
 	provider     string
 	input        string
 	systemPrompt string
@@ -291,6 +310,26 @@ func main() {
 		Run:   runRotateLogs,
 	}
 
+	// Add version command
+	var versionCmd = &cobra.Command{
+		Use:   "version",
+		Short: "Show version information",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Printf("Smart Suggestion %s\n", Version)
+			fmt.Printf("Build Time: %s\n", BuildTime)
+			fmt.Printf("Git Commit: %s\n", GitCommit)
+			fmt.Printf("OS: %s\n", OS)
+			fmt.Printf("Arch: %s\n", Arch)
+		},
+	}
+
+	// Add update command
+	var updateCmd = &cobra.Command{
+		Use:   "update",
+		Short: "Update smart-suggestion to the latest version",
+		Run:   runUpdate,
+	}
+
 	// Root command flags
 	rootCmd.Flags().StringVarP(&provider, "provider", "p", "", "AI provider (openai, azure_openai, anthropic, gemini, or deepseek)")
 	rootCmd.Flags().StringVarP(&input, "input", "i", "", "User input")
@@ -308,8 +347,13 @@ func main() {
 	rotateCmd.Flags().StringVarP(&proxyLogFile, "log-file", "l", "/tmp/smart_suggestion_proxy.log", "Log file path to rotate (required)")
 	rotateCmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
 
+	// Update command flags
+	updateCmd.Flags().BoolP("check-only", "c", false, "Only check for updates, don't install")
+
 	rootCmd.AddCommand(proxyCmd)
 	rootCmd.AddCommand(rotateCmd)
+	rootCmd.AddCommand(versionCmd)
+	rootCmd.AddCommand(updateCmd)
 
 	// Only require provider and input for the main fetch command
 	if len(os.Args) > 1 && os.Args[1] != "proxy" && os.Args[1] != "rotate-logs" {
@@ -1800,4 +1844,272 @@ func fetchDeepSeek() (string, error) {
 	}
 
 	return response.Choices[0].Message.Content, nil
+}
+
+func runUpdate(cmd *cobra.Command, args []string) {
+	checkOnly, _ := cmd.Flags().GetBool("check-only")
+
+	fmt.Println("Checking for updates...")
+
+	// Get current version
+	currentVersion := Version
+	if currentVersion == "dev" {
+		// TO TEST: Comment out this two lines and uncomment the line below to allow updating from development version
+		fmt.Println("Cannot update development version. Please install from releases.")
+		os.Exit(1)
+		// currentVersion = "0.0.0"
+	}
+
+	// Check for latest version
+	latestVersion, downloadURL, err := getLatestVersion()
+	if err != nil {
+		fmt.Printf("Failed to check for updates: %v\n", err)
+		os.Exit(1)
+	}
+
+	if currentVersion == latestVersion {
+		fmt.Println("Smart Suggestion is already up to date!")
+		if checkOnly {
+			os.Exit(0)
+		} else {
+			return
+		}
+	} else {
+		fmt.Printf("New version available: %s (current: %s)\n", latestVersion, currentVersion)
+		if checkOnly {
+			os.Exit(1) // Exit with code 1 to indicate update available
+		}
+	}
+
+	// Download and install update
+	if err := downloadAndInstallUpdate(downloadURL); err != nil {
+		fmt.Printf("Failed to update: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Successfully updated to version %s!\n", latestVersion)
+}
+
+func getLatestVersion() (string, string, error) {
+	resp, err := http.Get("https://api.github.com/repos/yetone/smart-suggestion/releases/latest")
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", err
+	}
+
+	var release GitHubRelease
+	if err := json.Unmarshal(body, &release); err != nil {
+		return "", "", err
+	}
+
+	// Detect platform
+	platform := fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
+
+	// Find matching asset
+	for _, asset := range release.Assets {
+		if strings.Contains(asset.Name, platform) {
+			return strings.TrimPrefix(release.TagName, "v"), asset.BrowserDownloadURL, nil
+		}
+	}
+
+	return "", "", fmt.Errorf("no release found for platform %s", platform)
+}
+
+func downloadAndInstallUpdate(downloadURL string) error {
+	// Create temporary directory
+	tempDir, err := os.MkdirTemp("", "smart-suggestion-update")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Download archive
+	tempFile := filepath.Join(tempDir, "update.tar.gz")
+	if err := downloadFile(downloadURL, tempFile); err != nil {
+		return err
+	}
+
+	// Extract archive
+	extractDir := filepath.Join(tempDir, "extracted")
+	if err := extractTarGz(tempFile, extractDir); err != nil {
+		return err
+	}
+
+	// Get current binary path
+	currentBinary, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	// Find new binary in extracted files
+	newBinary := filepath.Join(extractDir, "smart-suggestion")
+	if _, err := os.Stat(newBinary); os.IsNotExist(err) {
+		// Try to find in subdirectory
+		entries, err := os.ReadDir(extractDir)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				candidate := filepath.Join(extractDir, entry.Name(), "smart-suggestion")
+				if _, err := os.Stat(candidate); err == nil {
+					newBinary = candidate
+					break
+				}
+			}
+		}
+	}
+
+	// Backup current binary
+	backupPath := currentBinary + ".backup"
+	if err := copyFile(currentBinary, backupPath); err != nil {
+		return err
+	}
+
+	// Replace current binary
+	if err := copyFile(newBinary, currentBinary); err != nil {
+		// Restore backup on failure
+		os.Rename(backupPath, currentBinary)
+		return err
+	}
+
+	// Make executable
+	if err := os.Chmod(currentBinary, 0755); err != nil {
+		return err
+	}
+
+	// Remove backup
+	os.Remove(backupPath)
+
+	return nil
+}
+
+// Helper functions
+// downloadFile downloads a file from the given URL to the specified filepath with retry logic
+// It attempts up to 3 times with exponential backoff (1s, 2s, 4s) between retries
+func downloadFile(url, filepath string) error {
+	maxRetries := 3
+	baseDelay := time.Second
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Attempt to download the file
+		err := attemptDownload(url, filepath)
+		if err == nil {
+			return nil // Success
+		}
+
+		// If this is the last attempt, return the error
+		if attempt == maxRetries-1 {
+			return fmt.Errorf("download failed after %d attempts: %w", maxRetries, err)
+		}
+
+		// Calculate delay for exponential backoff: 1s, 2s, 4s
+		delay := baseDelay * time.Duration(1<<attempt)
+		fmt.Printf("Download attempt %d failed, retrying in %v: %v\n", attempt+1, delay, err)
+		time.Sleep(delay)
+	}
+
+	return fmt.Errorf("download failed after %d attempts", maxRetries)
+}
+
+// attemptDownload performs a single download attempt
+func attemptDownload(url, filepath string) error {
+	// Create HTTP client with timeout
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// Check for HTTP errors
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP error: %d %s", resp.StatusCode, resp.Status)
+	}
+
+	file, err := os.Create(filepath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, err = io.Copy(file, resp.Body)
+	return err
+}
+
+func extractTarGz(src, dest string) error {
+	file, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	gzr, err := gzip.NewReader(file)
+	if err != nil {
+		return err
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		path := filepath.Join(dest, header.Name)
+
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(path, 0755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+				return err
+			}
+
+			file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
+			if err != nil {
+				return err
+			}
+
+			_, err = io.Copy(file, tr)
+			file.Close()
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func copyFile(src, dst string) error {
+	source, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+
+	destination, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destination.Close()
+
+	_, err = io.Copy(destination, source)
+	return err
 }
