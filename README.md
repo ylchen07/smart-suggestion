@@ -12,6 +12,12 @@ Get AI-powered command suggestions **directly** in your zsh shell. No complex se
 
 <https://github.com/user-attachments/assets/90eaf300-c891-4ef9-958d-9890f53f9929>
 
+
+
+<https://github.com/user-attachments/assets/0e126456-4e52-4693-a8a8-d3bdb8a133e0>
+
+
+
 ## Features
 
 - **🚀 Context-aware intelligent prediction**: Predicts the next command you are likely to input based on context (history, aliases, terminal buffer)
