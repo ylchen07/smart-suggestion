@@ -85,7 +85,23 @@ cd ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/smart-suggestion
 source ~/.zshrc
 ```
 
-### Method 3: Manual Installation from Source
+### Method 3: Zinit
+
+1. Add the following to your `~/.zshrc`:
+
+```bash
+zinit as"program" atclone'./build.sh' \
+    atpull'%atclone' pick"smart-suggestion" src"smart-suggestion.plugin.zsh" for \
+        yetone/smart-suggestion
+```
+
+2. Update Zinit:
+
+```bash
+zi update
+```
+
+### Method 4: Manual Installation from Source
 
 1. Clone the repository:
 
@@ -112,7 +128,7 @@ source ~/.config/smart-suggestion/smart-suggestion.plugin.zsh
 source ~/.zshrc
 ```
 
-### Method 4: Manual Installation from Release
+### Method 5: Manual Installation from Release
 
 1. Download the latest release for your platform from [GitHub Releases](https://github.com/yetone/smart-suggestion/releases)
 
