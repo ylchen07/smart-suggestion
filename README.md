@@ -12,11 +12,7 @@ Get AI-powered command suggestions **directly** in your zsh shell. No complex se
 
 <https://github.com/user-attachments/assets/90eaf300-c891-4ef9-958d-9890f53f9929>
 
-
-
 <https://github.com/user-attachments/assets/0e126456-4e52-4693-a8a8-d3bdb8a133e0>
-
-
 
 ## Features
 
@@ -25,9 +21,10 @@ Get AI-powered command suggestions **directly** in your zsh shell. No complex se
 - **🔧 Highly Configurable**: Customize keybindings, AI provider, context sharing, and more
 
 ## Questions
-* Why don't I use [zsh-copilot](https://github.com/Myzel394/zsh-copilot) and instead fork a separate version?
 
-    Because the context of zsh-copilot only includes history commands and does not include the terminal buffer (i.e., the stdout/stderr of history commands), it cannot achieve the context-aware intelligent prediction I want, this is the feature I want the most, and it's also the main reason why I forked. Additionally, since zsh-copilot is written in shell, it's very difficult to concatenate JSON and implement stdio interception. Therefore, I re-implemented almost all logic using Go, which made it too different from the original project to merge back.
+- Why don't I use [zsh-copilot](https://github.com/Myzel394/zsh-copilot) and instead fork a separate version?
+
+  Because the context of zsh-copilot only includes history commands and does not include the terminal buffer (i.e., the stdout/stderr of history commands), it cannot achieve the context-aware intelligent prediction I want, this is the feature I want the most, and it's also the main reason why I forked. Additionally, since zsh-copilot is written in shell, it's very difficult to concatenate JSON and implement stdio interception. Therefore, I re-implemented almost all logic using Go, which made it too different from the original project to merge back.
 
 ## Installation
 
@@ -230,7 +227,7 @@ smart-suggestion
 1. **Start typing a command** or describe what you want to do
 2. **Press `CTRL + O`** (or your configured key)
 3. **Wait for the AI suggestion** (loading animation will show)
-   - *Note: On first use, proxy mode will automatically start in the background to capture terminal context*
+   - _Note: On first use, proxy mode will automatically start in the background to capture terminal context_
 4. **The suggestion will appear** as:
    - An autosuggestion you can accept with `→` (for completions)
    - A completely new command that replaces your input (for new commands)
